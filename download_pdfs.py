@@ -3,6 +3,7 @@ PDF Downloader — Nets4Dem Scopus Review
 Reads an Excel file, detects row highlight colors, and downloads PDFs via:
   Layer 1 - Unpaywall API (Open Access)
   Layer 2 - Direct DOI resolution via institutional VPN
+           (follows redirects, parses HTML to find the PDF link)
 """
 
 import os
@@ -10,6 +11,7 @@ import re
 import time
 import requests
 import openpyxl
+from urllib.parse import urljoin, urlparse
 
 # ─── CONFIGURATION ─────────────────────────────────────────────────────────────
 EXCEL_FILE      = "Nets4Dem_ScopusReview_Final_GA_12_June.xlsx"
@@ -114,20 +116,75 @@ def try_unpaywall(doi: str) -> str | None:
 
 
 def download_bytes(url: str) -> bytes | None:
+    """Download from a URL that is expected to return a PDF directly."""
     try:
         resp = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
         content_type = resp.headers.get("Content-Type", "")
         if resp.status_code == 200 and "pdf" in content_type.lower():
-            return resp.content
-        if resp.status_code == 200 and len(resp.content) > 10_000:
             return resp.content
         return None
     except Exception:
         return None
 
 
+# Patterns that commonly appear in publisher HTML pages pointing to the PDF
+_PDF_LINK_PATTERNS = [
+    r'href=["\']([^"\']*\.pdf[^"\']*)["\']',
+    r'href=["\']([^"\']*[?&]pdf[^"\']*)["\']',
+    r'content=["\']([^"\']*\.pdf[^"\']*)["\']',
+    # citation_pdf_url meta tag (Highwire, many publishers)
+    r'<meta[^>]+name=["\']citation_pdf_url["\'][^>]+content=["\']([^"\']+)["\']',
+    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']citation_pdf_url["\']',
+    # data-* attributes used by some publishers
+    r'data-pdf-url=["\']([^"\']+)["\']',
+    r'"pdfUrl"\s*:\s*"([^"]+)"',
+    r'"pdf_url"\s*:\s*"([^"]+)"',
+]
+
+
+def find_pdf_in_html(html: str, base_url: str) -> str | None:
+    """Search HTML text for a link that points to the full-text PDF."""
+    for pattern in _PDF_LINK_PATTERNS:
+        matches = re.findall(pattern, html, re.IGNORECASE)
+        for m in matches:
+            # Skip thumbnails, covers, supplementary files
+            if any(x in m.lower() for x in ["thumb", "cover", "suppl", "fig", "icon"]):
+                continue
+            # Make absolute URL
+            full = urljoin(base_url, m)
+            if urlparse(full).scheme in ("http", "https"):
+                return full
+    return None
+
+
 def download_via_vpn(doi: str) -> bytes | None:
-    return download_bytes(f"https://doi.org/{doi}")
+    """
+    Follow doi.org redirect, land on publisher page, extract PDF link,
+    then download the PDF.
+    """
+    doi_url = f"https://doi.org/{doi}"
+    try:
+        resp = requests.get(doi_url, headers=HEADERS, timeout=30, allow_redirects=True)
+        if resp.status_code != 200:
+            return None
+
+        content_type = resp.headers.get("Content-Type", "")
+
+        # Publisher served PDF directly (rare but possible)
+        if "pdf" in content_type.lower():
+            return resp.content
+
+        # Publisher served HTML — hunt for the PDF link
+        if "html" in content_type.lower() or "text" in content_type.lower():
+            pdf_url = find_pdf_in_html(resp.text, resp.url)
+            if pdf_url:
+                pdf_bytes = download_bytes(pdf_url)
+                if pdf_bytes:
+                    return pdf_bytes
+
+        return None
+    except Exception:
+        return None
 
 
 def main():
@@ -175,12 +232,12 @@ def main():
         except Exception as e:
             print(f"  [WARN] Unpaywall error: {e}")
 
-        # Layer 2: VPN
+        # Layer 2: VPN + HTML parsing
         if not pdf_bytes:
             try:
                 pdf_bytes = download_via_vpn(doi)
                 if pdf_bytes:
-                    source = "VPN"
+                    source = "VPN (HTML parsed)"
             except Exception as e:
                 print(f"  [WARN] VPN error: {e}")
 
