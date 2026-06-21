@@ -1,4 +1,4 @@
-﻿# Livro-Redes-Democracia
+﻿# EU_CivicTech_team
 
 ## What this repo is
 

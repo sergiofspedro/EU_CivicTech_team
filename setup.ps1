@@ -1,13 +1,13 @@
-# ============================================================
-# OpenCode Hackathon Setup Script — TEAM VERSION (tested)
-# Repo: Livro-Redes-Democracia
+﻿# ============================================================
+# OpenCode Hackathon Setup Script â€” TEAM VERSION (tested)
+# Repo: EU_CivicTech_team
 #
 # Prerequisites (do these first, manually):
 #   1. Install OpenCode Desktop from opencode.ai
 #   2. Get your own DeepSeek API key from platform.deepseek.com
 #   3. Clone this repo and cd into it:
-#        gh repo clone sergiofspedro/Livro-Redes-Democracia
-#        cd Livro-Redes-Democracia
+#        gh repo clone sergiofspedro/EU_CivicTech_team
+#        cd EU_CivicTech_team
 #   4. Allow script execution for this session:
 #        Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 #   5. Run this script:  .\setup.ps1
@@ -66,7 +66,7 @@ npm install -g firecrawl-cli
 Write-Host "ACTION NEEDED: run 'firecrawl login --browser' OR set your own FIRECRAWL_API_KEY (firecrawl.dev)" -ForegroundColor Yellow
 
 Write-Host "`n=== Step 9: Playwright MCP ===" -ForegroundColor Cyan
-Write-Host "Already in opencode.json (committed to repo) — no action needed" -ForegroundColor Green
+Write-Host "Already in opencode.json (committed to repo) â€” no action needed" -ForegroundColor Green
 
 Write-Host "`n=== Step 10: Composio MCP ===" -ForegroundColor Cyan
 Write-Host "ACTION NEEDED:" -ForegroundColor Yellow
@@ -77,7 +77,7 @@ Write-Host '       $env:COMPOSIO_API_KEY = "your-key-here"' -ForegroundColor Yel
 Write-Host "  4. Inside OpenCode, run /connect and select Composio"
 
 Write-Host "`n=== Step 11: Context7 ===" -ForegroundColor Cyan
-Write-Host "Included free inside Oh My OpenCode — no separate install" -ForegroundColor Green
+Write-Host "Included free inside Oh My OpenCode â€” no separate install" -ForegroundColor Green
 
 Write-Host "`n=== DONE - now launch OpenCode Desktop ===" -ForegroundColor Green
 Write-Host "Open the OpenCode Desktop app, use 'Open Folder' on this repo folder, then run:"

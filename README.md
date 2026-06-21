@@ -1,8 +1,8 @@
-# Livro-Redes-Democracia
+﻿# EU_CivicTech_team
 
-EU Civic Tech Hackathon project — 22–23 June 2026.
+EU Civic Tech Hackathon project â€” 22â€“23 June 2026.
 
-## Team Setup — OpenCode Environment
+## Team Setup â€” OpenCode Environment
 
 This project uses [OpenCode Desktop](https://opencode.ai) as the shared AI coding agent, with a curated stack of plugins and MCPs for the hackathon.
 
@@ -11,12 +11,12 @@ Download from [opencode.ai](https://opencode.ai).
 
 ### 2. Get your own API key
 Each team member needs their own DeepSeek API key from [platform.deepseek.com](https://platform.deepseek.com).
-(Other providers also work — ask in the team channel before switching the project default.)
+(Other providers also work â€” ask in the team channel before switching the project default.)
 
 ### 3. Clone this repo
 ```powershell
-gh repo clone sergiofspedro/Livro-Redes-Democracia
-cd Livro-Redes-Democracia
+gh repo clone sergiofspedro/EU_CivicTech_team
+cd EU_CivicTech_team
 ```
 
 ### 4. Allow script execution (this terminal session only)
@@ -29,15 +29,15 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\setup.ps1
 ```
 This installs the full shared stack:
-- **Oh My OpenCode** — multi-agent orchestration
-- **kdco/workspace bundle** — worktree, notify, delegation, planning agents
-- **Simple Memory** — git-committed shared team memory
-- **EnvSitter Guard** — blocks agents from reading/editing `.env` secrets
-- **opencode-firecrawl** — web scraping/crawling (e.g. EU open data sources)
-- **Playwright MCP** — browser automation/testing
-- **Context7 + Exa + gh_grep** — bundled free with Oh My OpenCode
+- **Oh My OpenCode** â€” multi-agent orchestration
+- **kdco/workspace bundle** â€” worktree, notify, delegation, planning agents
+- **Simple Memory** â€” git-committed shared team memory
+- **EnvSitter Guard** â€” blocks agents from reading/editing `.env` secrets
+- **opencode-firecrawl** â€” web scraping/crawling (e.g. EU open data sources)
+- **Playwright MCP** â€” browser automation/testing
+- **Context7 + Exa + gh_grep** â€” bundled free with Oh My OpenCode
 
-**Important:** the script installs `bun` first and will ask you to restart your terminal partway through — this is expected, just restart, `cd` back into the repo, and re-run `.\setup.ps1`.
+**Important:** the script installs `bun` first and will ask you to restart your terminal partway through â€” this is expected, just restart, `cd` back into the repo, and re-run `.\setup.ps1`.
 
 ### 6. Manual steps after the script
 Two things need one-time setup outside the script:
@@ -66,14 +66,14 @@ Open the OpenCode Desktop app, use **Open Folder** to point it at this repo fold
 
 **Known issue (safe to ignore):** `/init` may show a one-time Playwright `SyntaxError` during the repo scan. It's non-blocking and doesn't affect the rest of the session.
 
-### Project rules (automatic — see AGENTS.md)
+### Project rules (automatic â€” see AGENTS.md)
 - The agent will ask clarifying questions before ambiguous or non-trivial tasks
 - The agent will propose alternative approaches before committing to one
 - Local commits are fine; **pushing, opening PRs, or merging always require your explicit confirmation first**
 
 ### Shared vs personal config
-- `opencode.json` (committed) — shared MCPs and agent permissions. Don't edit unless agreed with the team.
-- `opencode.local.json` (gitignored) — your own personal overrides/extra instructions, optional, never shared.
+- `opencode.json` (committed) â€” shared MCPs and agent permissions. Don't edit unless agreed with the team.
+- `opencode.local.json` (gitignored) â€” your own personal overrides/extra instructions, optional, never shared.
 
 ### Security reminder
 Never commit or paste API keys anywhere in chat, Slack, or this repo. All keys go in environment variables (`$env:VAR_NAME = "..."`) or the app's own `/connect` prompts.
