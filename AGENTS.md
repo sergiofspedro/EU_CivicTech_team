@@ -1,48 +1,33 @@
-# Livro-Redes-Democracia
+﻿# Livro-Redes-Democracia
 
 ## What this repo is
 
-A single Python script that batch-downloads academic PDFs from DOIs listed in an Excel file, using Unpaywall (open access) then direct DOI resolution via institutional VPN.
+A civic tech prototype built for the EU Civic Tech Hackathon (22-23 June 2026), under the European Democracy Shield initiative. The project addresses a gap in EU civic participation infrastructure - see tools/philosophy.md for the guiding principles and README.md for team setup instructions.
+
+Note: this repo previously contained an unrelated PDF-downloading script (download_pdfs.py, Unpaywall/DOI-based). That was a different, earlier project and is not part of the current hackathon scope - disregard any references to it unless the file is still physically present and explicitly relevant.
 
 ## Setup
 
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate
-pip install -r requirements.txt
-```
+See README.md for the full team onboarding flow (OpenCode Desktop, API keys, setup.ps1, plugin stack).
 
-Dependencies: `pandas`, `openpyxl`, `requests` (pinned in [requirements.txt](requirements.txt)). The script explicitly uses `pd.read_excel(..., engine="openpyxl")`, so `openpyxl` is mandatory, not optional.
+## Project rules
 
-## Operation
+- Ask clarifying questions before starting any non-trivial or ambiguous task.
+- Propose alternative approaches with trade-offs before committing to one.
+- Local git commits are fine to make freely.
+- NEVER push to GitHub, open a pull request, or merge a pull request without explicit confirmation first.
 
-1. Place `artigos.xlsx` in the repo root with a column named `DOI`
-2. Edit `UNPAYWALL_EMAIL` in [download_pdfs.py:18](download_pdfs.py#L18) with your email
-3. PDFs land in `PDFs_Baixados/` (auto-created)
+## OpenCode environment
 
-```powershell
-python download_pdfs.py
-```
+- opencode.json loads instructions from ./tools/philosophy.md (project principles) and defines MCPs (Playwright, Context7, Exa, gh_grep) plus restricted agents (researcher, scribe, coder, reviewer, plan, build, explore) with granular bash/file permissions.
+- Plugin stack installed via setup.ps1: Oh My OpenCode, kdco/workspace bundle (worktree, notify, delegation, planning), Simple Memory, EnvSitter Guard, opencode-firecrawl, Playwright MCP, Composio MCP, Context7 (bundled).
+- worktree plugin confirmed working - use it for parallel branch work across team members.
+- .gitignore protects opencode.local.json (personal config overrides) from being committed.
 
-The script skips already-downloaded files (match by DOI → sanitized filename). `DELAY_SECONDS` (default 2, line 19) rate-limits requests between every DOI.
+## Known non-blocking issues
 
-## Key facts for agents
+- /init may show a one-time Playwright SyntaxError during repo scan. Safe to ignore.
 
-- **No tests, no type checker, no linter config, no formatter** — zero tooling beyond pip
-- **Single entrypoint**: [download_pdfs.py](download_pdfs.py)
-- **Two download layers**: Unpaywall (works without VPN) → VPN / direct DOI resolution (requires university VPN connection)
-- **`openpyxl` engine required**: `pd.read_excel(..., engine="openpyxl")` — do not switch to `xlrd`/`calamine` without testing
-- **`.gitignore` exists** but only ignores `opencode.local.json` and `.opencode/local/` — `artigos.xlsx` and `PDFs_Baixados/` are **not** gitignored by default. Be aware when making commits.
-- **`opencode.json` loads instructions** from `./tools/philosophy.md` (currently empty). No other shared instruction files are loaded.
-- **Repo-local OpenCode config**: 5 project skills under `.opencode/skills/` (`code-philosophy`, `code-review`, `frontend-philosophy`, `plan-protocol`, `plan-review`). The `opencode.json` also defines restricted agents (`researcher`, `scribe`, `coder`, `reviewer`, etc.) with granular bash permissions.
+## Tech stack
 
-## Download behaviour notes
-
-- [`clean_doi()`](download_pdfs.py#L31) strips URL prefixes (`https://doi.org/`, etc.) and whitespace before processing
-- [`sanitize_filename()`](download_pdfs.py#L41) replaces `\ / : * ? " < > |` with `_` for safe filenames
-- [`download_pdf()`](download_pdfs.py#L81) accepts a response as PDF if `Content-Type` contains `pdf` **or** the body exceeds 10 KB — catches misconfigured servers
-
-## Git
-
-- Commits are fine to make freely
-- **NEVER push, open a PR, or merge** without explicit confirmation
+(To be filled in once the team finalizes the hackathon concept and architecture.)
