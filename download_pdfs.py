@@ -1,8 +1,13 @@
 """
 PDF Downloader — Nets4Dem Scopus Review
-6-layer fallback pipeline:
-  1. Unpaywall   2. Semantic Scholar   3. OpenAlex
-  4. Europe PMC  5. Sci-Hub            6. VPN + HTML parsing
+Reads an Excel file, detects row highlight colors, and downloads PDFs via
+a 6-layer fallback pipeline:
+  1. Unpaywall API
+  2. Semantic Scholar
+  3. OpenAlex
+  4. Europe PMC
+  5. Sci-Hub
+  6. Direct DOI / VPN + HTML parsing
 """
 
 import os
@@ -75,7 +80,8 @@ def fetch(url: str, timeout: int = 20) -> requests.Response | None:
 
 
 def is_pdf(resp: requests.Response) -> bool:
-    return "pdf" in resp.headers.get("Content-Type", "").lower()
+    ct = resp.headers.get("Content-Type", "")
+    return "pdf" in ct.lower()
 
 
 def pdf_from_response(resp: requests.Response) -> bytes | None:
@@ -120,10 +126,9 @@ def collect_articles(wb) -> list[dict]:
 # ── Download layers ────────────────────────────────────────────────────────────
 
 def layer_unpaywall(doi: str) -> bytes | None:
+    url = f"https://api.unpaywall.org/v2/{doi}?email={UNPAYWALL_EMAIL}"
     try:
-        r = requests.get(
-            f"https://api.unpaywall.org/v2/{doi}?email={UNPAYWALL_EMAIL}",
-            headers=HEADERS, timeout=15)
+        r = requests.get(url, headers=HEADERS, timeout=15)
         if r.status_code != 200:
             return None
         data = r.json()
@@ -141,13 +146,14 @@ def layer_unpaywall(doi: str) -> bytes | None:
 
 
 def layer_semantic_scholar(doi: str) -> bytes | None:
+    url = f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}?fields=openAccessPdf"
     try:
-        r = requests.get(
-            f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}?fields=openAccessPdf",
-            headers=HEADERS, timeout=15)
+        r = requests.get(url, headers=HEADERS, timeout=15)
         if r.status_code != 200:
             return None
-        pdf_url = (r.json().get("openAccessPdf") or {}).get("url")
+        data = r.json()
+        oa = data.get("openAccessPdf") or {}
+        pdf_url = oa.get("url")
         if pdf_url:
             resp = fetch(pdf_url, timeout=30)
             if resp:
@@ -158,13 +164,14 @@ def layer_semantic_scholar(doi: str) -> bytes | None:
 
 
 def layer_openalex(doi: str) -> bytes | None:
+    url = f"https://api.openalex.org/works/https://doi.org/{doi}"
     try:
-        r = requests.get(
-            f"https://api.openalex.org/works/https://doi.org/{doi}",
-            headers=HEADERS, timeout=15)
+        r = requests.get(url, headers=HEADERS, timeout=15)
         if r.status_code != 200:
             return None
-        pdf_url = (r.json().get("open_access") or {}).get("oa_url")
+        data = r.json()
+        oa = data.get("open_access") or {}
+        pdf_url = oa.get("oa_url")
         if pdf_url:
             resp = fetch(pdf_url, timeout=30)
             if resp:
@@ -175,11 +182,12 @@ def layer_openalex(doi: str) -> bytes | None:
 
 
 def layer_europe_pmc(doi: str) -> bytes | None:
+    search_url = (
+        f"https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+        f"?query=DOI:{doi}&format=json&resultType=core"
+    )
     try:
-        r = requests.get(
-            f"https://www.ebi.ac.uk/europepmc/webservices/rest/search"
-            f"?query=DOI:{doi}&format=json&resultType=core",
-            headers=HEADERS, timeout=15)
+        r = requests.get(search_url, headers=HEADERS, timeout=15)
         if r.status_code != 200:
             return None
         results = r.json().get("resultList", {}).get("result", [])
@@ -187,7 +195,8 @@ def layer_europe_pmc(doi: str) -> bytes | None:
             return None
         pmcid = results[0].get("pmcid")
         if pmcid:
-            resp = fetch(f"https://europepmc.org/articles/{pmcid}/pdf/render", timeout=30)
+            pdf_url = f"https://europepmc.org/articles/{pmcid}/pdf/render"
+            resp = fetch(pdf_url, timeout=30)
             if resp:
                 return pdf_from_response(resp)
     except Exception:
@@ -202,8 +211,6 @@ _PDF_PATTERNS = [
     r'data-pdf-url=["\']([^"\']+)["\']',
     r'"pdfUrl"\s*:\s*"([^"]+)"',
     r'"pdf_url"\s*:\s*"([^"]+)"',
-    r'iframe[^>]+src=["\']([^"\']+)["\']',
-    r'embed[^>]+src=["\']([^"\']+)["\']',
 ]
 
 
@@ -225,9 +232,14 @@ def layer_scihub(doi: str) -> bytes | None:
                                 timeout=30, allow_redirects=True)
             if resp.status_code != 200:
                 continue
-            if is_pdf(resp) and len(resp.content) > 5_000:
-                return resp.content
             pdf_url = find_pdf_url_in_html(resp.text, resp.url)
+            for pattern in [r'iframe[^>]+src=["\']([^"\']+)["\']',
+                             r'embed[^>]+src=["\']([^"\']+)["\']']:
+                for m in re.findall(pattern, resp.text, re.IGNORECASE):
+                    candidate = urljoin(resp.url, m)
+                    if urlparse(candidate).scheme in ("http", "https"):
+                        pdf_url = pdf_url or candidate
+                        break
             if pdf_url:
                 dl = fetch(pdf_url, timeout=60)
                 if dl:
@@ -252,6 +264,8 @@ def layer_vpn_html(doi: str) -> bytes | None:
             return pdf_from_response(dl)
     return None
 
+
+# ── Pipeline ───────────────────────────────────────────────────────────────────
 
 LAYERS = [
     ("Unpaywall",        layer_unpaywall),
@@ -312,7 +326,7 @@ def main():
         if pdf_bytes:
             with open(path, "wb") as f:
                 f.write(pdf_bytes)
-            print(f"  [OK] {source} -> {path}")
+            print(f"  [OK] {source} → {path}")
             success += 1
         else:
             print(f"  [FAIL] All layers exhausted.")
@@ -324,7 +338,7 @@ def main():
     print(f"Done.  OK: {success}  |  Failed: {fail}  |  Skipped: {skipped}  |  Total: {total}")
     for folder in sorted(folders_needed):
         count = len([f for f in os.listdir(folder) if f.endswith(".pdf")])
-        print(f"  {folder}/  -> {count} PDFs")
+        print(f"  {folder}/  → {count} PDFs")
 
 
 if __name__ == "__main__":
