@@ -1,9 +1,8 @@
 """
 PDF Downloader — Nets4Dem Scopus Review
-Reads an Excel file, detects row highlight colors, and downloads PDFs via:
-  Layer 1 - Unpaywall API (Open Access)
-  Layer 2 - Direct DOI resolution via institutional VPN
-           (follows redirects, parses HTML to find the PDF link)
+6-layer fallback pipeline:
+  1. Unpaywall   2. Semantic Scholar   3. OpenAlex
+  4. Europe PMC  5. Sci-Hub            6. VPN + HTML parsing
 """
 
 import os
@@ -14,15 +13,21 @@ import openpyxl
 from urllib.parse import urljoin, urlparse
 
 # ─── CONFIGURATION ─────────────────────────────────────────────────────────────
-EXCEL_FILE      = "Nets4Dem_ScopusReview_Final_GA_12_June.xlsx"
+EXCEL_FILE      = "Nets4Dem_ScopusReview_Final_GA_12 June.xlsx"
 DOI_COLUMN      = "DOI"
-UNPAYWALL_EMAIL = "your_email@example.com"   # <-- change to your e-mail
+UNPAYWALL_EMAIL = "sergiopedro@ua.pt"
 DELAY_SECONDS   = 2
 
-YELLOW_COLOR    = "FFFFFF00"                 # bright yellow → scrape
-GREEN_COLORS    = {"FFC6EFCE", "FF92D050"}   # light/dark green → Future readings
+YELLOW_COLOR    = "FFFFFF00"
+GREEN_COLORS    = {"FFC6EFCE", "FF92D050"}
 SHEETS_TO_SCAN  = ["HIGH relevance", "MEDIUM screening"]
 FUTURE_FOLDER   = "Future readings"
+
+SCIHUB_MIRRORS  = [
+    "https://sci-hub.se",
+    "https://sci-hub.st",
+    "https://sci-hub.ru",
+]
 # ───────────────────────────────────────────────────────────────────────────────
 
 HEADERS = {
@@ -34,8 +39,9 @@ HEADERS = {
 }
 
 
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
 def clean_doi(raw) -> str | None:
-    """Return a bare DOI string, or None if the value is empty/invalid."""
     if raw is None:
         return None
     doi = str(raw).strip()
@@ -51,156 +57,238 @@ def sanitize_filename(doi: str) -> str:
 
 
 def row_color(ws_row) -> str | None:
-    """Return the fgColor RGB of the first colored cell in the row, or None."""
     for cell in ws_row:
         fill = cell.fill
         if fill and fill.fgColor and fill.fgColor.type == "rgb":
             rgb = fill.fgColor.rgb
-            if rgb and rgb != "00000000" and rgb != "FF000000":
+            if rgb and rgb not in ("00000000", "FF000000"):
                 return rgb
     return None
 
 
+def fetch(url: str, timeout: int = 20) -> requests.Response | None:
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
+        return r if r.status_code == 200 else None
+    except Exception:
+        return None
+
+
+def is_pdf(resp: requests.Response) -> bool:
+    return "pdf" in resp.headers.get("Content-Type", "").lower()
+
+
+def pdf_from_response(resp: requests.Response) -> bytes | None:
+    if is_pdf(resp) and len(resp.content) > 5_000:
+        return resp.content
+    return None
+
+
+# ── Excel scanning ─────────────────────────────────────────────────────────────
+
 def collect_articles(wb) -> list[dict]:
-    """
-    Walk SHEETS_TO_SCAN, detect row colors, and build a list of
-    {doi, folder} dicts for rows that need downloading.
-    """
     articles = []
     for sheet_name in SHEETS_TO_SCAN:
         if sheet_name not in wb.sheetnames:
-            print(f"[WARN] Sheet '{sheet_name}' not found — skipping.")
+            print(f"  [WARN] Sheet '{sheet_name}' not found — skipping.")
             continue
         ws = wb[sheet_name]
-
-        # Find DOI column index from header row
         header = [cell.value for cell in ws[1]]
         try:
             doi_idx = header.index(DOI_COLUMN)
         except ValueError:
-            print(f"[WARN] Column '{DOI_COLUMN}' not found in '{sheet_name}' — skipping.")
+            print(f"  [WARN] Column '{DOI_COLUMN}' not in '{sheet_name}' — skipping.")
             continue
 
         yellow_count = green_count = 0
         for row in ws.iter_rows(min_row=2):
             color = row_color(row)
+            doi = clean_doi(row[doi_idx].value)
+            if not doi:
+                continue
             if color == YELLOW_COLOR:
-                doi = clean_doi(row[doi_idx].value)
-                if doi:
-                    articles.append({"doi": doi, "folder": sheet_name})
-                    yellow_count += 1
+                articles.append({"doi": doi, "folder": sheet_name})
+                yellow_count += 1
             elif color in GREEN_COLORS:
-                doi = clean_doi(row[doi_idx].value)
-                if doi:
-                    articles.append({"doi": doi, "folder": FUTURE_FOLDER})
-                    green_count += 1
+                articles.append({"doi": doi, "folder": FUTURE_FOLDER})
+                green_count += 1
 
-        print(f"  '{sheet_name}': {yellow_count} yellow (scrape) | {green_count} green (Future readings)")
-
+        print(f"  '{sheet_name}': {yellow_count} yellow | {green_count} green")
     return articles
 
 
-def try_unpaywall(doi: str) -> str | None:
-    url = f"https://api.unpaywall.org/v2/{doi}?email={UNPAYWALL_EMAIL}"
+# ── Download layers ────────────────────────────────────────────────────────────
+
+def layer_unpaywall(doi: str) -> bytes | None:
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        if resp.status_code != 200:
+        r = requests.get(
+            f"https://api.unpaywall.org/v2/{doi}?email={UNPAYWALL_EMAIL}",
+            headers=HEADERS, timeout=15)
+        if r.status_code != 200:
             return None
-        data = resp.json()
+        data = r.json()
         if not data.get("is_oa"):
             return None
-        location = data.get("best_oa_location") or {}
-        return location.get("url_for_pdf") or location.get("url")
+        loc = data.get("best_oa_location") or {}
+        pdf_url = loc.get("url_for_pdf") or loc.get("url")
+        if pdf_url:
+            resp = fetch(pdf_url, timeout=30)
+            if resp:
+                return pdf_from_response(resp)
     except Exception:
-        return None
+        pass
+    return None
 
 
-def download_bytes(url: str) -> bytes | None:
-    """Download from a URL that is expected to return a PDF directly."""
+def layer_semantic_scholar(doi: str) -> bytes | None:
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
-        content_type = resp.headers.get("Content-Type", "")
-        if resp.status_code == 200 and "pdf" in content_type.lower():
-            return resp.content
-        return None
+        r = requests.get(
+            f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}?fields=openAccessPdf",
+            headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            return None
+        pdf_url = (r.json().get("openAccessPdf") or {}).get("url")
+        if pdf_url:
+            resp = fetch(pdf_url, timeout=30)
+            if resp:
+                return pdf_from_response(resp)
     except Exception:
-        return None
+        pass
+    return None
 
 
-# Patterns that commonly appear in publisher HTML pages pointing to the PDF
-_PDF_LINK_PATTERNS = [
-    r'href=["\']([^"\']*\.pdf[^"\']*)["\']',
-    r'href=["\']([^"\']*[?&]pdf[^"\']*)["\']',
-    r'content=["\']([^"\']*\.pdf[^"\']*)["\']',
-    # citation_pdf_url meta tag (Highwire, many publishers)
+def layer_openalex(doi: str) -> bytes | None:
+    try:
+        r = requests.get(
+            f"https://api.openalex.org/works/https://doi.org/{doi}",
+            headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            return None
+        pdf_url = (r.json().get("open_access") or {}).get("oa_url")
+        if pdf_url:
+            resp = fetch(pdf_url, timeout=30)
+            if resp:
+                return pdf_from_response(resp)
+    except Exception:
+        pass
+    return None
+
+
+def layer_europe_pmc(doi: str) -> bytes | None:
+    try:
+        r = requests.get(
+            f"https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+            f"?query=DOI:{doi}&format=json&resultType=core",
+            headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            return None
+        results = r.json().get("resultList", {}).get("result", [])
+        if not results:
+            return None
+        pmcid = results[0].get("pmcid")
+        if pmcid:
+            resp = fetch(f"https://europepmc.org/articles/{pmcid}/pdf/render", timeout=30)
+            if resp:
+                return pdf_from_response(resp)
+    except Exception:
+        pass
+    return None
+
+
+_PDF_PATTERNS = [
     r'<meta[^>]+name=["\']citation_pdf_url["\'][^>]+content=["\']([^"\']+)["\']',
     r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']citation_pdf_url["\']',
-    # data-* attributes used by some publishers
+    r'href=["\']([^"\']*\.pdf[^"\']*)["\']',
     r'data-pdf-url=["\']([^"\']+)["\']',
     r'"pdfUrl"\s*:\s*"([^"]+)"',
     r'"pdf_url"\s*:\s*"([^"]+)"',
+    r'iframe[^>]+src=["\']([^"\']+)["\']',
+    r'embed[^>]+src=["\']([^"\']+)["\']',
 ]
 
 
-def find_pdf_in_html(html: str, base_url: str) -> str | None:
-    """Search HTML text for a link that points to the full-text PDF."""
-    for pattern in _PDF_LINK_PATTERNS:
-        matches = re.findall(pattern, html, re.IGNORECASE)
-        for m in matches:
-            # Skip thumbnails, covers, supplementary files
+def find_pdf_url_in_html(html: str, base_url: str) -> str | None:
+    for pattern in _PDF_PATTERNS:
+        for m in re.findall(pattern, html, re.IGNORECASE):
             if any(x in m.lower() for x in ["thumb", "cover", "suppl", "fig", "icon"]):
                 continue
-            # Make absolute URL
             full = urljoin(base_url, m)
             if urlparse(full).scheme in ("http", "https"):
                 return full
     return None
 
 
-def download_via_vpn(doi: str) -> bytes | None:
-    """
-    Follow doi.org redirect, land on publisher page, extract PDF link,
-    then download the PDF.
-    """
-    doi_url = f"https://doi.org/{doi}"
-    try:
-        resp = requests.get(doi_url, headers=HEADERS, timeout=30, allow_redirects=True)
-        if resp.status_code != 200:
-            return None
-
-        content_type = resp.headers.get("Content-Type", "")
-
-        # Publisher served PDF directly (rare but possible)
-        if "pdf" in content_type.lower():
-            return resp.content
-
-        # Publisher served HTML — hunt for the PDF link
-        if "html" in content_type.lower() or "text" in content_type.lower():
-            pdf_url = find_pdf_in_html(resp.text, resp.url)
+def layer_scihub(doi: str) -> bytes | None:
+    for mirror in SCIHUB_MIRRORS:
+        try:
+            resp = requests.get(f"{mirror}/{doi}", headers=HEADERS,
+                                timeout=30, allow_redirects=True)
+            if resp.status_code != 200:
+                continue
+            if is_pdf(resp) and len(resp.content) > 5_000:
+                return resp.content
+            pdf_url = find_pdf_url_in_html(resp.text, resp.url)
             if pdf_url:
-                pdf_bytes = download_bytes(pdf_url)
-                if pdf_bytes:
-                    return pdf_bytes
+                dl = fetch(pdf_url, timeout=60)
+                if dl:
+                    result = pdf_from_response(dl)
+                    if result:
+                        return result
+        except Exception:
+            continue
+    return None
 
-        return None
-    except Exception:
-        return None
 
+def layer_vpn_html(doi: str) -> bytes | None:
+    resp = fetch(f"https://doi.org/{doi}", timeout=30)
+    if not resp:
+        return None
+    if is_pdf(resp):
+        return resp.content if len(resp.content) > 5_000 else None
+    pdf_url = find_pdf_url_in_html(resp.text, resp.url)
+    if pdf_url:
+        dl = fetch(pdf_url, timeout=30)
+        if dl:
+            return pdf_from_response(dl)
+    return None
+
+
+LAYERS = [
+    ("Unpaywall",        layer_unpaywall),
+    ("Semantic Scholar", layer_semantic_scholar),
+    ("OpenAlex",         layer_openalex),
+    ("Europe PMC",       layer_europe_pmc),
+    ("Sci-Hub",          layer_scihub),
+    ("VPN/HTML",         layer_vpn_html),
+]
+
+
+def download_pdf(doi: str) -> tuple[bytes | None, str | None]:
+    for name, fn in LAYERS:
+        try:
+            result = fn(doi)
+            if result:
+                return result, name
+        except Exception as e:
+            print(f"    [{name}] error: {e}")
+    return None, None
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     if not os.path.exists(EXCEL_FILE):
-        print(f"[ERROR] Excel file '{EXCEL_FILE}' not found in current directory.")
+        print(f"[ERROR] '{EXCEL_FILE}' not found in current directory.")
         return
 
     print(f"Reading '{EXCEL_FILE}' ...")
     wb = openpyxl.load_workbook(EXCEL_FILE, data_only=True)
 
-    print("Scanning sheets for highlighted rows ...")
+    print("Scanning sheets ...")
     articles = collect_articles(wb)
     total = len(articles)
-    print(f"\nTotal articles to download: {total}\n")
+    print(f"\nTotal articles to process: {total}\n")
 
-    # Create output folders
     folders_needed = {a["folder"] for a in articles}
     for folder in folders_needed:
         os.makedirs(folder, exist_ok=True)
@@ -210,8 +298,7 @@ def main():
     for idx, art in enumerate(articles, start=1):
         doi    = art["doi"]
         folder = art["folder"]
-        safe   = sanitize_filename(doi) + ".pdf"
-        path   = os.path.join(folder, safe)
+        path   = os.path.join(folder, sanitize_filename(doi) + ".pdf")
 
         print(f"[{idx}/{total}] {doi}")
 
@@ -220,43 +307,24 @@ def main():
             skipped += 1
             continue
 
-        pdf_bytes = source = None
-
-        # Layer 1: Unpaywall
-        try:
-            pdf_url = try_unpaywall(doi)
-            if pdf_url:
-                pdf_bytes = download_bytes(pdf_url)
-                if pdf_bytes:
-                    source = "Unpaywall (OA)"
-        except Exception as e:
-            print(f"  [WARN] Unpaywall error: {e}")
-
-        # Layer 2: VPN + HTML parsing
-        if not pdf_bytes:
-            try:
-                pdf_bytes = download_via_vpn(doi)
-                if pdf_bytes:
-                    source = "VPN (HTML parsed)"
-            except Exception as e:
-                print(f"  [WARN] VPN error: {e}")
+        pdf_bytes, source = download_pdf(doi)
 
         if pdf_bytes:
             with open(path, "wb") as f:
                 f.write(pdf_bytes)
-            print(f"  [OK] {source} → {path}")
+            print(f"  [OK] {source} -> {path}")
             success += 1
         else:
-            print(f"  [FAIL] Could not download.")
+            print(f"  [FAIL] All layers exhausted.")
             fail += 1
 
         time.sleep(DELAY_SECONDS)
 
     print(f"\n{'='*60}")
-    print(f"Done.  Success: {success}  |  Failed: {fail}  |  Skipped: {skipped}  |  Total: {total}")
+    print(f"Done.  OK: {success}  |  Failed: {fail}  |  Skipped: {skipped}  |  Total: {total}")
     for folder in sorted(folders_needed):
         count = len([f for f in os.listdir(folder) if f.endswith(".pdf")])
-        print(f"  {folder}/  → {count} PDFs")
+        print(f"  {folder}/  -> {count} PDFs")
 
 
 if __name__ == "__main__":
