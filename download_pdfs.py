@@ -1,6 +1,6 @@
 """
-PDF Downloader via DOI
-Reads DOIs from an Excel file and downloads PDFs using:
+PDF Downloader — Nets4Dem Scopus Review
+Reads an Excel file, detects row highlight colors, and downloads PDFs via:
   Layer 1 - Unpaywall API (Open Access)
   Layer 2 - Direct DOI resolution via institutional VPN
 """
@@ -9,15 +9,19 @@ import os
 import re
 import time
 import requests
-import pandas as pd
+import openpyxl
 
-# ─── CONFIGURATION ────────────────────────────────────────────────────────────
-EXCEL_FILE      = "artigos.xlsx"
-DOI_COLUMN_NAME = "DOI"
-OUTPUT_FOLDER   = "PDFs_Baixados"
+# ─── CONFIGURATION ─────────────────────────────────────────────────────────────
+EXCEL_FILE      = "Nets4Dem_ScopusReview_Final_GA_12_June.xlsx"
+DOI_COLUMN      = "DOI"
 UNPAYWALL_EMAIL = "your_email@example.com"   # <-- change to your e-mail
 DELAY_SECONDS   = 2
-# ──────────────────────────────────────────────────────────────────────────────
+
+YELLOW_COLOR    = "FFFFFF00"                 # bright yellow → scrape
+GREEN_COLORS    = {"FFC6EFCE", "FF92D050"}   # light/dark green → Future readings
+SHEETS_TO_SCAN  = ["HIGH relevance", "MEDIUM screening"]
+FUTURE_FOLDER   = "Future readings"
+# ───────────────────────────────────────────────────────────────────────────────
 
 HEADERS = {
     "User-Agent": (
@@ -28,25 +32,73 @@ HEADERS = {
 }
 
 
-def clean_doi(raw: str) -> str:
-    """Strip whitespace and any leading URL prefix, return bare DOI."""
+def clean_doi(raw) -> str | None:
+    """Return a bare DOI string, or None if the value is empty/invalid."""
+    if raw is None:
+        return None
     doi = str(raw).strip()
-    # remove common prefixes
     for prefix in ("https://doi.org/", "http://doi.org/", "doi.org/", "DOI:", "doi:"):
-        if doi.startswith(prefix):
+        if doi.lower().startswith(prefix.lower()):
             doi = doi[len(prefix):]
-    return doi.strip()
+    doi = doi.strip()
+    return doi if doi and doi.lower() != "nan" else None
 
 
 def sanitize_filename(doi: str) -> str:
-    """Replace characters invalid in filenames with underscores."""
     return re.sub(r'[\\/:*?"<>|]', "_", doi)
 
 
+def row_color(ws_row) -> str | None:
+    """Return the fgColor RGB of the first colored cell in the row, or None."""
+    for cell in ws_row:
+        fill = cell.fill
+        if fill and fill.fgColor and fill.fgColor.type == "rgb":
+            rgb = fill.fgColor.rgb
+            if rgb and rgb != "00000000" and rgb != "FF000000":
+                return rgb
+    return None
+
+
+def collect_articles(wb) -> list[dict]:
+    """
+    Walk SHEETS_TO_SCAN, detect row colors, and build a list of
+    {doi, folder} dicts for rows that need downloading.
+    """
+    articles = []
+    for sheet_name in SHEETS_TO_SCAN:
+        if sheet_name not in wb.sheetnames:
+            print(f"[WARN] Sheet '{sheet_name}' not found — skipping.")
+            continue
+        ws = wb[sheet_name]
+
+        # Find DOI column index from header row
+        header = [cell.value for cell in ws[1]]
+        try:
+            doi_idx = header.index(DOI_COLUMN)
+        except ValueError:
+            print(f"[WARN] Column '{DOI_COLUMN}' not found in '{sheet_name}' — skipping.")
+            continue
+
+        yellow_count = green_count = 0
+        for row in ws.iter_rows(min_row=2):
+            color = row_color(row)
+            if color == YELLOW_COLOR:
+                doi = clean_doi(row[doi_idx].value)
+                if doi:
+                    articles.append({"doi": doi, "folder": sheet_name})
+                    yellow_count += 1
+            elif color in GREEN_COLORS:
+                doi = clean_doi(row[doi_idx].value)
+                if doi:
+                    articles.append({"doi": doi, "folder": FUTURE_FOLDER})
+                    green_count += 1
+
+        print(f"  '{sheet_name}': {yellow_count} yellow (scrape) | {green_count} green (Future readings)")
+
+    return articles
+
+
 def try_unpaywall(doi: str) -> str | None:
-    """
-    Query Unpaywall. Return a PDF URL if the article is OA, else None.
-    """
     url = f"https://api.unpaywall.org/v2/{doi}?email={UNPAYWALL_EMAIL}"
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -56,36 +108,17 @@ def try_unpaywall(doi: str) -> str | None:
         if not data.get("is_oa"):
             return None
         location = data.get("best_oa_location") or {}
-        pdf_url = location.get("url_for_pdf") or location.get("url")
-        return pdf_url if pdf_url else None
+        return location.get("url_for_pdf") or location.get("url")
     except Exception:
         return None
 
 
-def try_vpn_download(doi: str) -> bytes | None:
-    """
-    Follow https://doi.org/<doi> with browser headers.
-    The university VPN IP grants access; we expect a PDF response.
-    """
-    doi_url = f"https://doi.org/{doi}"
+def download_bytes(url: str) -> bytes | None:
     try:
-        resp = requests.get(doi_url, headers=HEADERS, timeout=30, allow_redirects=True)
+        resp = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
         content_type = resp.headers.get("Content-Type", "")
         if resp.status_code == 200 and "pdf" in content_type.lower():
             return resp.content
-        return None
-    except Exception:
-        return None
-
-
-def download_pdf(pdf_url: str) -> bytes | None:
-    """Download bytes from a direct PDF URL."""
-    try:
-        resp = requests.get(pdf_url, headers=HEADERS, timeout=30, stream=True)
-        content_type = resp.headers.get("Content-Type", "")
-        if resp.status_code == 200 and "pdf" in content_type.lower():
-            return resp.content
-        # Some servers omit Content-Type; accept if response is large enough
         if resp.status_code == 200 and len(resp.content) > 10_000:
             return resp.content
         return None
@@ -93,78 +126,80 @@ def download_pdf(pdf_url: str) -> bytes | None:
         return None
 
 
-def main():
-    # Ensure output folder exists
-    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+def download_via_vpn(doi: str) -> bytes | None:
+    return download_bytes(f"https://doi.org/{doi}")
 
-    # Load Excel
+
+def main():
     if not os.path.exists(EXCEL_FILE):
         print(f"[ERROR] Excel file '{EXCEL_FILE}' not found in current directory.")
         return
 
-    df = pd.read_excel(EXCEL_FILE, engine="openpyxl")
+    print(f"Reading '{EXCEL_FILE}' ...")
+    wb = openpyxl.load_workbook(EXCEL_FILE, data_only=True)
 
-    if DOI_COLUMN_NAME not in df.columns:
-        available = ", ".join(df.columns.tolist())
-        print(f"[ERROR] Column '{DOI_COLUMN_NAME}' not found. Available columns: {available}")
-        return
+    print("Scanning sheets for highlighted rows ...")
+    articles = collect_articles(wb)
+    total = len(articles)
+    print(f"\nTotal articles to download: {total}\n")
 
-    # Filter valid DOI rows
-    doi_series = df[DOI_COLUMN_NAME].dropna()
-    dois = [clean_doi(d) for d in doi_series if str(d).strip() not in ("", "nan")]
-    total = len(dois)
-    print(f"Found {total} DOIs to process.\n")
+    # Create output folders
+    folders_needed = {a["folder"] for a in articles}
+    for folder in folders_needed:
+        os.makedirs(folder, exist_ok=True)
 
-    success_count = 0
-    fail_count = 0
+    success = fail = skipped = 0
 
-    for idx, doi in enumerate(dois, start=1):
-        print(f"Processing {idx}/{total}: {doi} ...")
-        safe_name = sanitize_filename(doi) + ".pdf"
-        out_path  = os.path.join(OUTPUT_FOLDER, safe_name)
+    for idx, art in enumerate(articles, start=1):
+        doi    = art["doi"]
+        folder = art["folder"]
+        safe   = sanitize_filename(doi) + ".pdf"
+        path   = os.path.join(folder, safe)
 
-        if os.path.exists(out_path):
-            print(f"  [SKIP] Already downloaded.")
-            success_count += 1
-            time.sleep(DELAY_SECONDS)
+        print(f"[{idx}/{total}] {doi}")
+
+        if os.path.exists(path):
+            print(f"  [SKIP] Already exists.")
+            skipped += 1
             continue
 
-        pdf_bytes = None
-        source    = None
+        pdf_bytes = source = None
 
-        # ── Layer 1: Unpaywall ──────────────────────────────────────────────
+        # Layer 1: Unpaywall
         try:
             pdf_url = try_unpaywall(doi)
             if pdf_url:
-                pdf_bytes = download_pdf(pdf_url)
+                pdf_bytes = download_bytes(pdf_url)
                 if pdf_bytes:
                     source = "Unpaywall (OA)"
         except Exception as e:
             print(f"  [WARN] Unpaywall error: {e}")
 
-        # ── Layer 2: VPN / direct DOI resolution ───────────────────────────
+        # Layer 2: VPN
         if not pdf_bytes:
             try:
-                pdf_bytes = try_vpn_download(doi)
+                pdf_bytes = download_via_vpn(doi)
                 if pdf_bytes:
-                    source = "VPN (institutional access)"
+                    source = "VPN"
             except Exception as e:
-                print(f"  [WARN] VPN download error: {e}")
+                print(f"  [WARN] VPN error: {e}")
 
-        # ── Save or log failure ─────────────────────────────────────────────
         if pdf_bytes:
-            with open(out_path, "wb") as f:
+            with open(path, "wb") as f:
                 f.write(pdf_bytes)
-            print(f"  [OK] Saved via {source} → {out_path}")
-            success_count += 1
+            print(f"  [OK] {source} → {path}")
+            success += 1
         else:
-            print(f"  [FAIL] Could not download PDF for {doi}")
-            fail_count += 1
+            print(f"  [FAIL] Could not download.")
+            fail += 1
 
         time.sleep(DELAY_SECONDS)
 
-    print(f"\nDone. Success: {success_count}/{total}  |  Failed: {fail_count}/{total}")
-    print(f"PDFs saved in: {os.path.abspath(OUTPUT_FOLDER)}")
+    print(f"\n{'='*60}")
+    print(f"Done.  Success: {success}  |  Failed: {fail}  |  Skipped: {skipped}  |  Total: {total}")
+    for folder in sorted(folders_needed):
+        count = len([f for f in os.listdir(folder) if f.endswith(".pdf")])
+        print(f"  {folder}/  → {count} PDFs")
 
 
 if __name__ == "__main__":
