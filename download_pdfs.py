@@ -308,6 +308,7 @@ def main():
         os.makedirs(folder, exist_ok=True)
 
     success = fail = skipped = 0
+    failed_list = []  # collect (doi, folder) for failed downloads
 
     for idx, art in enumerate(articles, start=1):
         doi    = art["doi"]
@@ -330,6 +331,8 @@ def main():
             success += 1
         else:
             print(f"  [FAIL] All layers exhausted.")
+            failed_list.append({"doi": doi, "folder": folder,
+                                 "doi_url": f"https://doi.org/{doi}"})
             fail += 1
 
         time.sleep(DELAY_SECONDS)
@@ -339,6 +342,16 @@ def main():
     for folder in sorted(folders_needed):
         count = len([f for f in os.listdir(folder) if f.endswith(".pdf")])
         print(f"  {folder}/  → {count} PDFs")
+
+    # Write failed DOIs to CSV
+    if failed_list:
+        import csv
+        csv_path = "failed_downloads.csv"
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["doi", "folder", "doi_url"])
+            writer.writeheader()
+            writer.writerows(failed_list)
+        print(f"\nFailed DOIs saved to: {os.path.abspath(csv_path)}")
 
 
 if __name__ == "__main__":
