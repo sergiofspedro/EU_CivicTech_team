@@ -1,17 +1,17 @@
 """
 PDF Downloader — Nets4Dem Scopus Review
-Reads an Excel file, detects row highlight colors, and downloads PDFs via
-a 6-layer fallback pipeline with improved extraction and diagnostics:
-  1. Unpaywall API (all OA locations, not just best)
-  2. Semantic Scholar
-  3. OpenAlex (all locations array)
-  4. Europe PMC
-  5. Sci-Hub (improved protocol-relative URL handling)
-  6. Direct DOI / VPN + HTML parsing
+Downloads PDFs for highlighted rows in Excel via an 8-layer pipeline:
+  1. Unpaywall     (all OA locations)
+  2. CORE API      (200M+ OA papers)
+  3. Semantic Scholar
+  4. OpenAlex      (all locations)
+  5. PubMed Central
+  6. Europe PMC
+  7. Sci-Hub       (improved URL parsing + title fallback)
+  8. VPN/HTML      (doi.org with session + cookies)
 
-On completion writes:
-  - failed_downloads.csv  (DOIs that failed with per-layer reason)
-  - download_log.csv      (all results with source used)
+Retry mode: if failed_downloads.csv exists, processes only those DOIs.
+Outputs: failed_downloads.csv, download_log.csv
 """
 
 import os
@@ -20,13 +20,17 @@ import csv
 import time
 import requests
 import openpyxl
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, quote_plus
 
 # ─── CONFIGURATION ─────────────────────────────────────────────────────────────
 EXCEL_FILE      = "Nets4Dem_ScopusReview_Final_GA_12 June.xlsx"
 DOI_COLUMN      = "DOI"
+TITLE_COLUMN    = "Title"
 UNPAYWALL_EMAIL = "sergiopedro@ua.pt"
+CORE_API_KEY    = "pcjCa9P8V74fHKlGNT503RqD6nLSzwZg"
 DELAY_SECONDS   = 2
+RETRY_TIMES     = 2       # retries per layer on timeout/connection error
+RETRY_DELAY     = 3       # seconds between retries (doubles each time)
 
 YELLOW_COLOR    = "FFFFFF00"
 GREEN_COLORS    = {"FFC6EFCE", "FF92D050"}
@@ -41,13 +45,25 @@ SCIHUB_MIRRORS  = [
 ]
 # ───────────────────────────────────────────────────────────────────────────────
 
-HEADERS = {
+BASE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
+
+PDF_HEADERS = {
+    **BASE_HEADERS,
+    "Accept": "application/pdf,application/octet-stream,*/*;q=0.8",
+}
+
+
+# ── Session (shared across all requests for cookie persistence) ────────────────
+SESSION = requests.Session()
+SESSION.headers.update(BASE_HEADERS)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -78,29 +94,40 @@ def row_color(ws_row) -> str | None:
 
 
 def make_absolute(url: str, base: str) -> str | None:
-    """Handle http://, https://, and protocol-relative // URLs."""
     if not url:
         return None
     if url.startswith("//"):
-        parsed_base = urlparse(base)
-        url = f"{parsed_base.scheme}:{url}"
+        scheme = urlparse(base).scheme or "https"
+        url = f"{scheme}:{url}"
     full = urljoin(base, url)
     return full if urlparse(full).scheme in ("http", "https") else None
 
 
-def fetch(url: str, timeout: int = 20) -> tuple[requests.Response | None, str]:
-    """Returns (response, error_reason). Response is None on failure."""
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
-        if r.status_code == 200:
-            return r, ""
-        return None, f"HTTP {r.status_code}"
-    except requests.exceptions.Timeout:
-        return None, "timeout"
-    except requests.exceptions.ConnectionError:
-        return None, "connection error"
-    except Exception as e:
-        return None, str(e)
+def fetch(url: str, timeout: int = 20, headers: dict = None,
+          referer: str = None) -> tuple[requests.Response | None, str]:
+    """Fetch with retry on timeout/connection error. Returns (response, error)."""
+    hdrs = dict(headers or BASE_HEADERS)
+    if referer:
+        hdrs["Referer"] = referer
+
+    last_err = ""
+    delay = RETRY_DELAY
+    for attempt in range(1 + RETRY_TIMES):
+        try:
+            r = SESSION.get(url, headers=hdrs, timeout=timeout, allow_redirects=True)
+            if r.status_code == 200:
+                return r, ""
+            return None, f"HTTP {r.status_code}"
+        except requests.exceptions.Timeout:
+            last_err = "timeout"
+        except requests.exceptions.ConnectionError:
+            last_err = "connection error"
+        except Exception as e:
+            return None, str(e)
+        if attempt < RETRY_TIMES:
+            time.sleep(delay)
+            delay *= 2
+    return None, last_err
 
 
 def is_pdf(resp: requests.Response) -> bool:
@@ -114,9 +141,9 @@ def pdf_from_response(resp: requests.Response) -> bytes | None:
     return None
 
 
-def try_download_url(url: str, timeout: int = 30) -> tuple[bytes | None, str]:
-    """Download a URL, return (bytes, reason). bytes is None on failure."""
-    resp, err = fetch(url, timeout=timeout)
+def try_download_url(url: str, timeout: int = 30,
+                     referer: str = None) -> tuple[bytes | None, str]:
+    resp, err = fetch(url, timeout=timeout, headers=PDF_HEADERS, referer=referer)
     if not resp:
         return None, err
     pdf = pdf_from_response(resp)
@@ -141,6 +168,7 @@ def collect_articles(wb) -> list[dict]:
         except ValueError:
             print(f"  [WARN] Column '{DOI_COLUMN}' not in '{sheet_name}' — skipping.")
             continue
+        title_idx = header.index(TITLE_COLUMN) if TITLE_COLUMN in header else None
 
         yellow_count = green_count = 0
         for row in ws.iter_rows(min_row=2):
@@ -148,11 +176,15 @@ def collect_articles(wb) -> list[dict]:
             doi = clean_doi(row[doi_idx].value)
             if not doi:
                 continue
+            title = str(row[title_idx].value).strip() if title_idx is not None and row[title_idx].value else ""
+            entry = {"doi": doi, "title": title}
             if color == YELLOW_COLOR:
-                articles.append({"doi": doi, "folder": sheet_name})
+                entry["folder"] = sheet_name
+                articles.append(entry)
                 yellow_count += 1
             elif color in GREEN_COLORS:
-                articles.append({"doi": doi, "folder": FUTURE_FOLDER})
+                entry["folder"] = FUTURE_FOLDER
+                articles.append(entry)
                 green_count += 1
 
         print(f"  '{sheet_name}': {yellow_count} yellow | {green_count} green")
@@ -161,8 +193,7 @@ def collect_articles(wb) -> list[dict]:
 
 # ── Download layers ────────────────────────────────────────────────────────────
 
-def layer_unpaywall(doi: str) -> tuple[bytes | None, str]:
-    """Check ALL oa_locations, not just best_oa_location."""
+def layer_unpaywall(doi: str, **_) -> tuple[bytes | None, str]:
     url = f"https://api.unpaywall.org/v2/{doi}?email={UNPAYWALL_EMAIL}"
     try:
         r, err = fetch(url, timeout=15)
@@ -171,7 +202,6 @@ def layer_unpaywall(doi: str) -> tuple[bytes | None, str]:
         data = r.json()
         if not data.get("is_oa"):
             return None, "not OA"
-        # Collect all candidate PDF URLs from every location
         locations = data.get("oa_locations") or []
         best = data.get("best_oa_location")
         if best:
@@ -180,7 +210,7 @@ def layer_unpaywall(doi: str) -> tuple[bytes | None, str]:
             pdf_url = loc.get("url_for_pdf") or loc.get("url")
             if not pdf_url:
                 continue
-            pdf, reason = try_download_url(pdf_url)
+            pdf, reason = try_download_url(pdf_url, referer=f"https://doi.org/{doi}")
             if pdf:
                 return pdf, ""
         return None, "OA locations found but no PDF downloadable"
@@ -188,7 +218,27 @@ def layer_unpaywall(doi: str) -> tuple[bytes | None, str]:
         return None, str(e)
 
 
-def layer_semantic_scholar(doi: str) -> tuple[bytes | None, str]:
+def layer_core(doi: str, **_) -> tuple[bytes | None, str]:
+    url = f"https://api.core.ac.uk/v3/works?q=doi%3A{quote_plus(doi)}&limit=1"
+    try:
+        r, err = fetch(url, timeout=15,
+                       headers={**BASE_HEADERS, "Authorization": f"Bearer {CORE_API_KEY}"})
+        if not r:
+            return None, f"API error: {err}"
+        data = r.json()
+        results = data.get("results") or []
+        if not results:
+            return None, "not found in CORE"
+        download_url = results[0].get("downloadUrl") or results[0].get("sourceFulltextUrls", [None])[0]
+        if not download_url:
+            return None, "found in CORE but no download URL"
+        pdf, reason = try_download_url(download_url, referer=f"https://doi.org/{doi}")
+        return (pdf, "") if pdf else (None, reason)
+    except Exception as e:
+        return None, str(e)
+
+
+def layer_semantic_scholar(doi: str, **_) -> tuple[bytes | None, str]:
     url = f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}?fields=openAccessPdf"
     try:
         r, err = fetch(url, timeout=15)
@@ -199,27 +249,23 @@ def layer_semantic_scholar(doi: str) -> tuple[bytes | None, str]:
         pdf_url = oa.get("url")
         if not pdf_url:
             return None, "no OA PDF in response"
-        pdf, reason = try_download_url(pdf_url)
+        pdf, reason = try_download_url(pdf_url, referer=f"https://doi.org/{doi}")
         return (pdf, "") if pdf else (None, reason)
     except Exception as e:
         return None, str(e)
 
 
-def layer_openalex(doi: str) -> tuple[bytes | None, str]:
-    """Check open_access.oa_url AND every entry in the locations array."""
+def layer_openalex(doi: str, **_) -> tuple[bytes | None, str]:
     url = f"https://api.openalex.org/works/https://doi.org/{doi}"
     try:
         r, err = fetch(url, timeout=15)
         if not r:
             return None, f"API error: {err}"
         data = r.json()
-
         candidate_urls = []
         oa = data.get("open_access") or {}
         if oa.get("oa_url"):
             candidate_urls.append(oa["oa_url"])
-
-        # locations array — each may have a pdf_url
         for loc in data.get("locations") or []:
             pu = loc.get("pdf_url")
             lu = loc.get("landing_page_url")
@@ -227,12 +273,10 @@ def layer_openalex(doi: str) -> tuple[bytes | None, str]:
                 candidate_urls.append(pu)
             elif lu and loc.get("is_oa"):
                 candidate_urls.append(lu)
-
         if not candidate_urls:
             return None, "no OA URLs in response"
-
         for cu in candidate_urls:
-            pdf, reason = try_download_url(cu)
+            pdf, reason = try_download_url(cu, referer=f"https://doi.org/{doi}")
             if pdf:
                 return pdf, ""
         return None, "URLs found but no PDF downloadable"
@@ -240,7 +284,27 @@ def layer_openalex(doi: str) -> tuple[bytes | None, str]:
         return None, str(e)
 
 
-def layer_europe_pmc(doi: str) -> tuple[bytes | None, str]:
+def layer_pubmed_central(doi: str, **_) -> tuple[bytes | None, str]:
+    search_url = (
+        f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+        f"?db=pmc&term={quote_plus(doi)}[doi]&retmode=json"
+    )
+    try:
+        r, err = fetch(search_url, timeout=15)
+        if not r:
+            return None, f"API error: {err}"
+        ids = r.json().get("esearchresult", {}).get("idlist", [])
+        if not ids:
+            return None, "not in PMC"
+        pmcid = f"PMC{ids[0]}"
+        pdf_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/pdf/"
+        pdf, reason = try_download_url(pdf_url, referer=f"https://doi.org/{doi}")
+        return (pdf, "") if pdf else (None, reason)
+    except Exception as e:
+        return None, str(e)
+
+
+def layer_europe_pmc(doi: str, **_) -> tuple[bytes | None, str]:
     search_url = (
         f"https://www.ebi.ac.uk/europepmc/webservices/rest/search"
         f"?query=DOI:{doi}&format=json&resultType=core"
@@ -256,7 +320,7 @@ def layer_europe_pmc(doi: str) -> tuple[bytes | None, str]:
         if not pmcid:
             return None, "found but no PMCID (not OA)"
         pdf_url = f"https://europepmc.org/articles/{pmcid}/pdf/render"
-        pdf, reason = try_download_url(pdf_url)
+        pdf, reason = try_download_url(pdf_url, referer=f"https://doi.org/{doi}")
         return (pdf, "") if pdf else (None, reason)
     except Exception as e:
         return None, str(e)
@@ -283,55 +347,53 @@ def find_pdf_url_in_html(html: str, base_url: str) -> str | None:
     return None
 
 
-def layer_scihub(doi: str) -> tuple[bytes | None, str]:
-    """Try each mirror; handle protocol-relative (//host/path) iframe URLs."""
+def layer_scihub(doi: str, title: str = "", **_) -> tuple[bytes | None, str]:
     last_reason = "no mirrors reachable"
-    for mirror in SCIHUB_MIRRORS:
-        try:
-            resp, err = fetch(f"{mirror}/{doi}", timeout=30)
-            if not resp:
-                last_reason = f"{mirror}: {err}"
-                continue
 
-            # Sci-Hub serves PDF in an iframe/embed whose src may be:
-            #   //cdn.../file.pdf  (protocol-relative)
-            #   https://cdn.../file.pdf
-            #   /tree/...pdf
-            pdf_url = None
-            for pattern in [
-                r'<iframe[^>]+src=["\']([^"\']+)["\']',
-                r'<embed[^>]+src=["\']([^"\']+)["\']',
-                r'onclick=["\'][^"\']*location\.href\s*=\s*["\']([^"\']+)["\']',
-            ]:
-                for m in re.findall(pattern, resp.text, re.IGNORECASE):
-                    candidate = make_absolute(m, resp.url)
-                    if candidate:
-                        pdf_url = candidate
-                        break
-                if pdf_url:
+    def _try_scihub_page(url: str) -> tuple[bytes | None, str]:
+        resp, err = fetch(url, timeout=30)
+        if not resp:
+            return None, err
+        pdf_url = None
+        for pattern in [
+            r'<iframe[^>]+src=["\']([^"\']+)["\']',
+            r'<embed[^>]+src=["\']([^"\']+)["\']',
+        ]:
+            for m in re.findall(pattern, resp.text, re.IGNORECASE):
+                candidate = make_absolute(m, resp.url)
+                if candidate:
+                    pdf_url = candidate
                     break
-
-            # Fallback to generic HTML PDF patterns
-            if not pdf_url:
-                pdf_url = find_pdf_url_in_html(resp.text, resp.url)
-
             if pdf_url:
-                pdf, reason = try_download_url(pdf_url, timeout=60)
-                if pdf:
-                    return pdf, ""
-                last_reason = f"{mirror}: PDF URL found ({pdf_url}) but {reason}"
-            else:
-                last_reason = f"{mirror}: no PDF URL found in HTML"
+                break
+        if not pdf_url:
+            pdf_url = find_pdf_url_in_html(resp.text, resp.url)
+        if not pdf_url:
+            return None, f"no PDF URL found in HTML ({url})"
+        pdf, reason = try_download_url(pdf_url, timeout=60, referer=url)
+        return (pdf, "") if pdf else (None, f"PDF URL found but {reason}")
 
-        except Exception as e:
-            last_reason = f"{mirror}: {e}"
-            continue
+    for mirror in SCIHUB_MIRRORS:
+        pdf, reason = _try_scihub_page(f"{mirror}/{doi}")
+        if pdf:
+            return pdf, ""
+        last_reason = f"{mirror}/doi: {reason}"
+
+    # Fallback: search by title if available
+    if title:
+        for mirror in SCIHUB_MIRRORS[:2]:
+            search_url = f"{mirror}/?request={quote_plus(title)}"
+            pdf, reason = _try_scihub_page(search_url)
+            if pdf:
+                return pdf, ""
+            last_reason = f"{mirror}/title: {reason}"
 
     return None, last_reason
 
 
-def layer_vpn_html(doi: str) -> tuple[bytes | None, str]:
-    resp, err = fetch(f"https://doi.org/{doi}", timeout=30)
+def layer_vpn_html(doi: str, **_) -> tuple[bytes | None, str]:
+    doi_url = f"https://doi.org/{doi}"
+    resp, err = fetch(doi_url, timeout=30, referer="https://www.google.com/")
     if not resp:
         return None, f"doi.org unreachable: {err}"
     if is_pdf(resp):
@@ -339,8 +401,8 @@ def layer_vpn_html(doi: str) -> tuple[bytes | None, str]:
         return (pdf, "") if pdf else (None, "response was PDF but too small")
     pdf_url = find_pdf_url_in_html(resp.text, resp.url)
     if not pdf_url:
-        return None, f"landed on {resp.url} — no PDF link in HTML (JS-rendered?)"
-    pdf, reason = try_download_url(pdf_url)
+        return None, f"landed on {resp.url} — no PDF link in static HTML (may need JS)"
+    pdf, reason = try_download_url(pdf_url, referer=resp.url)
     return (pdf, "") if pdf else (None, f"PDF URL {pdf_url}: {reason}")
 
 
@@ -348,20 +410,21 @@ def layer_vpn_html(doi: str) -> tuple[bytes | None, str]:
 
 LAYERS = [
     ("Unpaywall",        layer_unpaywall),
+    ("CORE",             layer_core),
     ("Semantic Scholar", layer_semantic_scholar),
     ("OpenAlex",         layer_openalex),
+    ("PubMed Central",   layer_pubmed_central),
     ("Europe PMC",       layer_europe_pmc),
     ("Sci-Hub",          layer_scihub),
     ("VPN/HTML",         layer_vpn_html),
 ]
 
 
-def download_pdf(doi: str) -> tuple[bytes | None, str | None, dict]:
-    """Returns (bytes, source_name, {layer: reason}) — reasons only for failures."""
+def download_pdf(doi: str, title: str = "") -> tuple[bytes | None, str | None, dict]:
     reasons = {}
     for name, fn in LAYERS:
         try:
-            pdf, reason = fn(doi)
+            pdf, reason = fn(doi=doi, title=title)
             if pdf:
                 return pdf, name, reasons
             reasons[name] = reason or "no PDF"
@@ -373,19 +436,14 @@ def download_pdf(doi: str) -> tuple[bytes | None, str | None, dict]:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    # Allow running only on failed_downloads.csv if it exists
-    retry_mode = os.path.exists("failed_downloads.csv") and not any(
-        os.path.exists(os.path.join(f, x))
-        for f in [FUTURE_FOLDER, "HIGH relevance", "MEDIUM screening"]
-        for x in [""] if os.path.isdir(os.path.join(".", f))
-    )
+    failed_csv = "failed_downloads.csv"
 
-    if retry_mode:
-        print("Detected failed_downloads.csv — running in RETRY mode (only failed DOIs).")
-        import csv as _csv
-        with open("failed_downloads.csv", encoding="utf-8") as f:
-            reader = _csv.DictReader(f)
-            articles = [{"doi": row["doi"], "folder": row["folder"]} for row in reader]
+    if os.path.exists(failed_csv):
+        print(f"Found {failed_csv} — running in RETRY mode (only failed DOIs).\n")
+        with open(failed_csv, encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            articles = [{"doi": row["doi"], "folder": row["folder"], "title": row.get("title", "")}
+                        for row in reader]
     else:
         if not os.path.exists(EXCEL_FILE):
             print(f"[ERROR] '{EXCEL_FILE}' not found in current directory.")
@@ -396,7 +454,7 @@ def main():
         articles = collect_articles(wb)
 
     total = len(articles)
-    print(f"\nTotal articles to process: {total}\n")
+    print(f"Total articles to process: {total}\n")
 
     folders_needed = {a["folder"] for a in articles}
     for folder in folders_needed:
@@ -409,6 +467,7 @@ def main():
     for idx, art in enumerate(articles, start=1):
         doi    = art["doi"]
         folder = art["folder"]
+        title  = art.get("title", "")
         path   = os.path.join(folder, sanitize_filename(doi) + ".pdf")
 
         print(f"[{idx}/{total}] {doi}")
@@ -416,24 +475,27 @@ def main():
         if os.path.exists(path):
             print(f"  [SKIP] Already exists.")
             skipped += 1
-            log_rows.append({"doi": doi, "folder": folder, "status": "skip", "source": "", "reasons": ""})
+            log_rows.append({"doi": doi, "folder": folder, "status": "skip",
+                              "source": "", "reasons": ""})
             continue
 
-        pdf_bytes, source, reasons = download_pdf(doi)
+        pdf_bytes, source, reasons = download_pdf(doi, title=title)
 
         if pdf_bytes:
             with open(path, "wb") as f:
                 f.write(pdf_bytes)
             print(f"  [OK] {source} → {path}")
             success += 1
-            log_rows.append({"doi": doi, "folder": folder, "status": "ok", "source": source, "reasons": ""})
+            log_rows.append({"doi": doi, "folder": folder, "status": "ok",
+                              "source": source, "reasons": ""})
         else:
             reason_str = " | ".join(f"{k}: {v}" for k, v in reasons.items())
             print(f"  [FAIL] {reason_str}")
-            failed_list.append({"doi": doi, "folder": folder,
+            failed_list.append({"doi": doi, "folder": folder, "title": title,
                                  "doi_url": f"https://doi.org/{doi}",
                                  "reasons": reason_str})
-            log_rows.append({"doi": doi, "folder": folder, "status": "fail", "source": "", "reasons": reason_str})
+            log_rows.append({"doi": doi, "folder": folder, "status": "fail",
+                              "source": "", "reasons": reason_str})
             fail += 1
 
         time.sleep(DELAY_SECONDS)
@@ -445,19 +507,21 @@ def main():
             count = len([f for f in os.listdir(folder) if f.endswith(".pdf")])
             print(f"  {folder}/  → {count} PDFs")
 
-    import csv
     if failed_list:
-        with open("failed_downloads.csv", "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["doi", "folder", "doi_url", "reasons"])
+        with open(failed_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["doi", "folder", "title", "doi_url", "reasons"])
             writer.writeheader()
             writer.writerows(failed_list)
-        print(f"\nFailed DOIs → failed_downloads.csv ({len(failed_list)} entries)")
+        print(f"\nFailed DOIs → {failed_csv} ({len(failed_list)} entries)")
+    elif os.path.exists(failed_csv):
+        os.remove(failed_csv)
+        print(f"\nAll retries succeeded — {failed_csv} removed.")
 
     with open("download_log.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["doi", "folder", "status", "source", "reasons"])
         writer.writeheader()
         writer.writerows(log_rows)
-    print(f"Full log    → download_log.csv")
+    print(f"Full log → download_log.csv")
 
 
 if __name__ == "__main__":
