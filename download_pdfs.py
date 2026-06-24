@@ -95,6 +95,20 @@ def row_color(ws_row) -> str | None:
     return None
 
 
+def safe_json(resp: requests.Response) -> tuple[dict | None, str]:
+    """Parse JSON safely; return (data, error). Handles empty/HTML responses."""
+    if not resp.content:
+        return None, "empty response body"
+    ct = resp.headers.get("Content-Type", "")
+    if "html" in ct.lower() and "json" not in ct.lower():
+        return None, f"got HTML instead of JSON (rate-limited or bot check?)"
+    try:
+        return resp.json(), ""
+    except Exception as e:
+        preview = resp.text[:80].replace("\n", " ")
+        return None, f"JSON parse error: {e} | body: {preview}"
+
+
 def make_absolute(url: str, base: str) -> str | None:
     if not url:
         return None
@@ -222,7 +236,9 @@ def layer_unpaywall(doi: str, **_) -> tuple[bytes | None, str]:
         r, err = fetch(url, timeout=15)
         if not r:
             return None, f"API error: {err}"
-        data = r.json()
+        data, jerr = safe_json(r)
+        if data is None:
+            return None, jerr
         if not data.get("is_oa"):
             return None, "not OA"
         locations = data.get("oa_locations") or []
@@ -243,7 +259,6 @@ def layer_unpaywall(doi: str, **_) -> tuple[bytes | None, str]:
 
 def layer_core(doi: str, **_) -> tuple[bytes | None, str]:
     core_headers = {**BASE_HEADERS, "Authorization": f"Bearer {CORE_API_KEY}"}
-    # Try direct DOI lookup first (most precise)
     for url in [
         f"https://api.core.ac.uk/v3/works/doi:{doi}",
         f"https://api.core.ac.uk/v3/search/works?q=doi%3A%22{quote_plus(doi)}%22&limit=1",
@@ -252,8 +267,9 @@ def layer_core(doi: str, **_) -> tuple[bytes | None, str]:
             r, err = fetch(url, timeout=15, headers=core_headers)
             if not r:
                 continue
-            data = r.json()
-            # Direct lookup returns object; search returns {results: [...]}
+            data, jerr = safe_json(r)
+            if data is None:
+                continue
             results = data.get("results") or ([data] if data.get("id") else [])
             if not results:
                 continue
@@ -284,7 +300,9 @@ def layer_semantic_scholar(doi: str, **_) -> tuple[bytes | None, str]:
         r, err = fetch(url, timeout=15)
         if not r:
             return None, f"API error: {err}"
-        data = r.json()
+        data, jerr = safe_json(r)
+        if data is None:
+            return None, jerr
         oa = data.get("openAccessPdf") or {}
         pdf_url = oa.get("url")
         if not pdf_url:
@@ -301,7 +319,9 @@ def layer_openalex(doi: str, **_) -> tuple[bytes | None, str]:
         r, err = fetch(url, timeout=15)
         if not r:
             return None, f"API error: {err}"
-        data = r.json()
+        data, jerr = safe_json(r)
+        if data is None:
+            return None, jerr
         candidate_urls = []
         oa = data.get("open_access") or {}
         if oa.get("oa_url"):
@@ -333,7 +353,10 @@ def layer_pubmed_central(doi: str, **_) -> tuple[bytes | None, str]:
         r, err = fetch(search_url, timeout=15)
         if not r:
             return None, f"API error: {err}"
-        ids = r.json().get("esearchresult", {}).get("idlist", [])
+        data, jerr = safe_json(r)
+        if data is None:
+            return None, jerr
+        ids = data.get("esearchresult", {}).get("idlist", [])
         if not ids:
             return None, "not in PMC"
         pmcid = f"PMC{ids[0]}"
@@ -353,7 +376,10 @@ def layer_europe_pmc(doi: str, **_) -> tuple[bytes | None, str]:
         r, err = fetch(search_url, timeout=15)
         if not r:
             return None, f"API error: {err}"
-        results = r.json().get("resultList", {}).get("result", [])
+        data, jerr = safe_json(r)
+        if data is None:
+            return None, jerr
+        results = data.get("resultList", {}).get("result", [])
         if not results:
             return None, "not found in Europe PMC"
         pmcid = results[0].get("pmcid")
