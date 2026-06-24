@@ -41,7 +41,6 @@ SCIHUB_MIRRORS  = [
     "https://sci-hub.se",
     "https://sci-hub.st",
     "https://sci-hub.ru",
-    "https://sci-hub.mksa.top",
 ]
 # ───────────────────────────────────────────────────────────────────────────────
 
@@ -52,7 +51,10 @@ BASE_HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 PDF_HEADERS = {
@@ -143,14 +145,35 @@ def pdf_from_response(resp: requests.Response) -> bytes | None:
 
 def try_download_url(url: str, timeout: int = 30,
                      referer: str = None) -> tuple[bytes | None, str]:
-    resp, err = fetch(url, timeout=timeout, headers=PDF_HEADERS, referer=referer)
-    if not resp:
-        return None, err
-    pdf = pdf_from_response(resp)
-    if pdf:
-        return pdf, ""
-    ct = resp.headers.get("Content-Type", "unknown")
-    return None, f"not a PDF (Content-Type: {ct}, size: {len(resp.content)})"
+    hdrs = dict(PDF_HEADERS)
+    if referer:
+        hdrs["Referer"] = referer
+    last_err = ""
+    delay = RETRY_DELAY
+    for attempt in range(1 + RETRY_TIMES):
+        try:
+            r = SESSION.get(url, headers=hdrs, timeout=timeout, allow_redirects=True)
+            # HTTP 204 = No Content — server may require auth redirect; retry as GET
+            if r.status_code == 204:
+                last_err = "HTTP 204 (no content)"
+                break
+            if r.status_code != 200:
+                return None, f"HTTP {r.status_code}"
+            pdf = pdf_from_response(r)
+            if pdf:
+                return pdf, ""
+            ct = r.headers.get("Content-Type", "unknown")
+            return None, f"not a PDF (Content-Type: {ct}, size: {len(r.content)})"
+        except requests.exceptions.Timeout:
+            last_err = "timeout"
+        except requests.exceptions.ConnectionError:
+            last_err = "connection error"
+        except Exception as e:
+            return None, str(e)
+        if attempt < RETRY_TIMES:
+            time.sleep(delay)
+            delay *= 2
+    return None, last_err
 
 
 # ── Excel scanning ─────────────────────────────────────────────────────────────
@@ -219,23 +242,40 @@ def layer_unpaywall(doi: str, **_) -> tuple[bytes | None, str]:
 
 
 def layer_core(doi: str, **_) -> tuple[bytes | None, str]:
-    url = f"https://api.core.ac.uk/v3/works?q=doi%3A{quote_plus(doi)}&limit=1"
-    try:
-        r, err = fetch(url, timeout=15,
-                       headers={**BASE_HEADERS, "Authorization": f"Bearer {CORE_API_KEY}"})
-        if not r:
-            return None, f"API error: {err}"
-        data = r.json()
-        results = data.get("results") or []
-        if not results:
-            return None, "not found in CORE"
-        download_url = results[0].get("downloadUrl") or results[0].get("sourceFulltextUrls", [None])[0]
-        if not download_url:
-            return None, "found in CORE but no download URL"
-        pdf, reason = try_download_url(download_url, referer=f"https://doi.org/{doi}")
-        return (pdf, "") if pdf else (None, reason)
-    except Exception as e:
-        return None, str(e)
+    core_headers = {**BASE_HEADERS, "Authorization": f"Bearer {CORE_API_KEY}"}
+    # Try direct DOI lookup first (most precise)
+    for url in [
+        f"https://api.core.ac.uk/v3/works/doi:{doi}",
+        f"https://api.core.ac.uk/v3/search/works?q=doi%3A%22{quote_plus(doi)}%22&limit=1",
+    ]:
+        try:
+            r, err = fetch(url, timeout=15, headers=core_headers)
+            if not r:
+                continue
+            data = r.json()
+            # Direct lookup returns object; search returns {results: [...]}
+            results = data.get("results") or ([data] if data.get("id") else [])
+            if not results:
+                continue
+            item = results[0]
+            candidates = []
+            if item.get("downloadUrl"):
+                candidates.append(item["downloadUrl"])
+            for fu in item.get("fullTextIdentifier") or []:
+                candidates.append(fu)
+            for fu in item.get("sourceFulltextUrls") or []:
+                candidates.append(fu)
+            for candidate in candidates:
+                if not candidate:
+                    continue
+                pdf, reason = try_download_url(candidate, referer=f"https://doi.org/{doi}")
+                if pdf:
+                    return pdf, ""
+            if candidates:
+                return None, "CORE URLs found but no PDF downloadable"
+        except Exception:
+            continue
+    return None, "not found in CORE"
 
 
 def layer_semantic_scholar(doi: str, **_) -> tuple[bytes | None, str]:
@@ -391,18 +431,45 @@ def layer_scihub(doi: str, title: str = "", **_) -> tuple[bytes | None, str]:
     return None, last_reason
 
 
+def ojs_pdf_url(page_url: str, html: str) -> str | None:
+    """
+    Open Journal Systems uses /article/view/{id}/{galley}
+    The PDF download URL is /article/download/{id}/{galley}
+    """
+    m = re.search(r'/article/view/(\d+)/(\d+)', page_url)
+    if m:
+        base = page_url[:page_url.index('/article/view/')]
+        return f"{base}/article/download/{m.group(1)}/{m.group(2)}"
+    # Also handle /index.php/{journal}/article/view pattern
+    m2 = re.search(r'(/index\.php/[^/]+/article)/view/(\d+)/(\d+)', page_url)
+    if m2:
+        base = urlparse(page_url).scheme + "://" + urlparse(page_url).netloc
+        return f"{base}{m2.group(1)}/download/{m2.group(2)}/{m2.group(3)}"
+    return None
+
+
 def layer_vpn_html(doi: str, **_) -> tuple[bytes | None, str]:
     doi_url = f"https://doi.org/{doi}"
-    resp, err = fetch(doi_url, timeout=30, referer="https://www.google.com/")
+    resp, err = fetch(doi_url, timeout=30, referer="https://scholar.google.com/")
     if not resp:
         return None, f"doi.org unreachable: {err}"
     if is_pdf(resp):
         pdf = resp.content if len(resp.content) > 5_000 else None
         return (pdf, "") if pdf else (None, "response was PDF but too small")
-    pdf_url = find_pdf_url_in_html(resp.text, resp.url)
+
+    final_url = resp.url
+
+    # OJS detection
+    ojs_url = ojs_pdf_url(final_url, resp.text)
+    if ojs_url:
+        pdf, reason = try_download_url(ojs_url, referer=final_url)
+        if pdf:
+            return pdf, ""
+
+    pdf_url = find_pdf_url_in_html(resp.text, final_url)
     if not pdf_url:
-        return None, f"landed on {resp.url} — no PDF link in static HTML (may need JS)"
-    pdf, reason = try_download_url(pdf_url, referer=resp.url)
+        return None, f"landed on {final_url} — no PDF link in static HTML (may need JS)"
+    pdf, reason = try_download_url(pdf_url, referer=final_url)
     return (pdf, "") if pdf else (None, f"PDF URL {pdf_url}: {reason}")
 
 
