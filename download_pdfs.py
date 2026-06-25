@@ -517,64 +517,85 @@ def layer_playwright(doi: str, **_) -> tuple[bytes | None, str]:
     except ImportError:
         return None, "Playwright not installed (run: pip install playwright && python -m playwright install chromium)"
 
-    # Publisher-specific direct PDF URL patterns derived from landing page URL
-    def publisher_pdf_url(url: str) -> str | None:
-        # Taylor & Francis: /doi/full/X -> /doi/pdf/X
+    import tempfile
+
+    def _is_same_page(candidate: str, page_url: str) -> bool:
+        return candidate.split('#')[0].rstrip('/') == page_url.split('#')[0].rstrip('/')
+
+    # Publisher-specific PDF page URL (some are reader pages, not direct PDFs)
+    def publisher_pdf_page_url(url: str) -> str | None:
         m = re.match(r'(https://www\.tandfonline\.com/doi/)(?:full|abs|epub)/(.*)', url)
         if m:
             return f"{m.group(1)}pdf/{m.group(2)}"
-        # Oxford OUP: /article/X -> /article/X/pdf
-        m = re.match(r'(https://academic\.oup\.com/.+/article/[\d/]+)(?:\?.*)?$', url)
-        if m:
+        m = re.match(r'(https://academic\.oup\.com/[^?#]+/article/[^?#]+?)(?:/pdf)?(?:[?#].*)?$', url)
+        if m and '/pdf' not in m.group(1):
             return f"{m.group(1)}/pdf"
-        # SAGE: /doi/full/X or /doi/abs/X -> /doi/pdf/X
         m = re.match(r'(https://journals\.sagepub\.com/doi/)(?:full|abs|epub)/(.*)', url)
         if m:
             return f"{m.group(1)}pdf/{m.group(2)}"
-        # Wiley: /doi/full/X -> /doi/pdf/X or /doi/epdf/X
         m = re.match(r'(https://onlinelibrary\.wiley\.com/doi/)(?:full|abs|epub)/(.*)', url)
         if m:
             return f"{m.group(1)}pdf/{m.group(2)}"
-        # Springer: /article/X -> /article/X.pdf
-        m = re.match(r'(https://link\.springer\.com/article/[^\?]+)', url)
+        m = re.match(r'https://link\.springer\.com/article/([^?#]+)', url)
         if m:
-            return f"{m.group(1)}.pdf"
+            return f"https://link.springer.com/content/pdf/{m.group(1)}.pdf"
         return None
 
-    # Selectors that trigger PDF download across major publishers
     PDF_BUTTON_SELECTORS = [
-        # Generic
-        "a[href$='.pdf']",
-        "a[href*='/pdf/']",
-        "a[href*='.pdf?']",
-        "a[data-track-action='download pdf']",
-        "a[data-track-action='Download PDF']",
-        "a.pdf-download",
-        "a#download-pdf",
-        "a[title*='PDF' i]",
-        "a[aria-label*='PDF' i]",
-        "a:has-text('Download PDF')",
-        "a:has-text('View PDF')",
-        "a:has-text('Full Text PDF')",
         # Cambridge
-        "a.pdf[href*='cambridge.org']",
-        "a[data-icon='download']",
+        "li.pdf a", "a.pdf[data-product-id]",
         # Taylor & Francis
-        "a.show-pdf",
-        "a[href*='/doi/pdf/']",
-        "a[href*='/doi/epdf/']",
+        "a[href*='/doi/pdf/']", "a[href*='/doi/epdf/']", "a.show-pdf",
         # SAGE
         "a[href*='/doi/pdf/']",
-        "a[href*='/doi/reader/']",
         # Springer/Nature
-        "a[data-track-action*='pdf' i]",
-        "a.c-pdf-download__link",
+        "a.c-pdf-download__link", "a[data-track-action='download pdf']",
+        "a[data-track-action='Download PDF']",
+        # Wiley
+        "a[href*='/doi/epdf/']",
+        # OUP
+        "a[href*='/pdf']",
         # Elsevier
-        "a.pdf-download-btn-link",
-        "a[href*='pdfft']",
+        "a.pdf-download-btn-link", "a[href*='pdfft']",
+        # Generic
+        "a[href$='.pdf']", "a[href*='.pdf?']", "a[data-pdf-url]",
+        "a.pdf-download", "a#download-pdf",
+        "a[title*='PDF' i]", "a[aria-label*='PDF' i]",
+        "a:has-text('Download PDF')", "a:has-text('View PDF')",
+        "a:has-text('Full Text PDF')", "a:has-text('Open PDF')",
     ]
 
     doi_url = f"https://doi.org/{doi}"
+
+    def _fetch_with_browser_cookies(url: str, referer: str, context) -> bytes | None:
+        cookies = {c["name"]: c["value"] for c in context.cookies()}
+        try:
+            r = requests.get(url, headers={**PDF_HEADERS, "Referer": referer},
+                             cookies=cookies, timeout=45, allow_redirects=True)
+            if r.status_code == 200 and "pdf" in r.headers.get("Content-Type", "").lower():
+                if len(r.content) > 5_000:
+                    return r.content
+        except Exception:
+            pass
+        return None
+
+    def _scan_page_for_pdf_url(page, html: str, page_url: str) -> str | None:
+        # 1. scan HTML
+        candidate = find_pdf_url_in_html(html, page_url)
+        if candidate and not _is_same_page(candidate, page_url):
+            return candidate
+        # 2. iterate button selectors
+        for selector in PDF_BUTTON_SELECTORS:
+            try:
+                el = page.locator(selector).first
+                href = el.get_attribute("href", timeout=1_200)
+                if href and href not in ("#", "", "javascript:void(0)"):
+                    abs_href = make_absolute(href, page_url)
+                    if abs_href and not _is_same_page(abs_href, page_url):
+                        return abs_href
+            except Exception:
+                continue
+        return None
 
     try:
         with sync_playwright() as pw:
@@ -590,7 +611,6 @@ def layer_playwright(doi: str, **_) -> tuple[bytes | None, str]:
             pdf_bytes = None
             pdf_url_found = None
 
-            # Intercept network responses to catch direct PDF streams
             def on_response(response):
                 nonlocal pdf_bytes
                 if pdf_bytes:
@@ -606,7 +626,7 @@ def layer_playwright(doi: str, **_) -> tuple[bytes | None, str]:
 
             page.on("response", on_response)
 
-            # Navigate to doi.org
+            # ── Step 1: navigate to doi.org ───────────────────────────────────
             try:
                 page.goto(doi_url, wait_until="networkidle", timeout=45_000)
             except PWTimeout:
@@ -619,84 +639,62 @@ def layer_playwright(doi: str, **_) -> tuple[bytes | None, str]:
             final_url = page.url
             html = page.content()
 
-            # 1. Try publisher-specific direct PDF URL from landing page URL
-            direct = publisher_pdf_url(final_url)
-            if direct:
-                pdf_url_found = direct
+            # ── Step 2: OJS detection ─────────────────────────────────────────
+            ojs = ojs_pdf_url(final_url, html)
+            if ojs:
+                pdf_url_found = ojs
 
-            # 2. OJS detection
+            # ── Step 3: scan landing page HTML + buttons ──────────────────────
             if not pdf_url_found:
-                ojs = ojs_pdf_url(final_url, html)
-                if ojs:
-                    pdf_url_found = ojs
+                pdf_url_found = _scan_page_for_pdf_url(page, html, final_url)
 
-            # 3. Scan rendered HTML for PDF links (filter out same-page anchors)
-            if not pdf_url_found:
-                candidate = find_pdf_url_in_html(html, final_url)
-                if candidate and not candidate.rstrip('/').endswith(final_url.rstrip('/')):
-                    if not re.search(r'^' + re.escape(final_url.split('#')[0]) + r'#', candidate):
-                        pdf_url_found = candidate
-
-            # 4. Try clicking PDF buttons and intercept the download
+            # ── Step 4: navigate to publisher PDF page, scan again ────────────
             if not pdf_url_found and not pdf_bytes:
-                for selector in PDF_BUTTON_SELECTORS:
+                pub_url = publisher_pdf_page_url(final_url)
+                if pub_url:
                     try:
-                        el = page.locator(selector).first
-                        href = el.get_attribute("href", timeout=1_500)
-                        if href and href not in ("#", "", "javascript:void(0)"):
-                            abs_href = make_absolute(href, final_url)
-                            if abs_href and abs_href != final_url:
-                                pdf_url_found = abs_href
-                                break
-                    except Exception:
-                        continue
+                        page.goto(pub_url, wait_until="networkidle", timeout=30_000)
+                    except PWTimeout:
+                        pass
+                    if pdf_bytes:
+                        browser.close()
+                        return pdf_bytes, ""
+                    pub_html = page.content()
+                    pub_final = page.url
+                    found = _scan_page_for_pdf_url(page, pub_html, pub_final)
+                    pdf_url_found = found if found else pub_url
 
-            # 5. If still no URL, try clicking and intercepting file download
+            # ── Step 5: click-to-download interception ────────────────────────
             if not pdf_url_found and not pdf_bytes:
                 for selector in ["a:has-text('Download PDF')", "a:has-text('PDF')",
-                                  "button:has-text('PDF')", "a[data-track-action*='pdf' i]"]:
+                                  "button:has-text('PDF')", "a.c-pdf-download__link",
+                                  "a[data-track-action*='pdf' i]"]:
                     try:
                         el = page.locator(selector).first
                         if el.count() == 0:
                             continue
-                        with context.expect_page(timeout=5_000) as new_page_info:
+                        with context.expect_download(timeout=10_000) as dl_info:
                             el.click(timeout=3_000)
-                        new_page = new_page_info.value
-                        new_page.wait_for_load_state("networkidle", timeout=20_000)
-                        if pdf_bytes:
-                            break
-                        # Check if new page IS the PDF
-                        np_ct = new_page.evaluate("document.contentType || ''")
-                        if "pdf" in np_ct.lower():
+                        download = dl_info.value
+                        tmp = tempfile.mktemp(suffix=".pdf")
+                        download.save_as(tmp)
+                        with open(tmp, "rb") as fh:
+                            data = fh.read()
+                        os.unlink(tmp)
+                        if data and len(data) > 5_000:
+                            pdf_bytes = data
                             break
                     except Exception:
                         pass
-                    if pdf_bytes:
-                        break
 
-            # 6. Navigate to found URL, using browser cookies for auth
+            # ── Step 6: navigate to found URL + download with cookies ─────────
             if pdf_url_found and not pdf_bytes:
                 try:
                     page.goto(pdf_url_found, wait_until="networkidle", timeout=30_000)
                 except PWTimeout:
                     pass
-
-            if not pdf_bytes and pdf_url_found:
-                # Fetch using browser session cookies
-                cookies = {c["name"]: c["value"] for c in context.cookies()}
-                try:
-                    r = requests.get(
-                        pdf_url_found,
-                        headers={**PDF_HEADERS, "Referer": final_url},
-                        cookies=cookies,
-                        timeout=30,
-                        allow_redirects=True,
-                    )
-                    if r.status_code == 200 and "pdf" in r.headers.get("Content-Type", "").lower():
-                        if len(r.content) > 5_000:
-                            pdf_bytes = r.content
-                except Exception:
-                    pass
+                if not pdf_bytes:
+                    pdf_bytes = _fetch_with_browser_cookies(pdf_url_found, final_url, context)
 
             browser.close()
 
