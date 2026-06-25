@@ -1,6 +1,6 @@
 """
 PDF Downloader — Nets4Dem Scopus Review
-Downloads PDFs for highlighted rows in Excel via an 8-layer pipeline:
+Downloads PDFs for highlighted rows in Excel via a 9-layer pipeline:
   1. Unpaywall     (all OA locations)
   2. CORE API      (200M+ OA papers)
   3. Semantic Scholar
@@ -9,9 +9,14 @@ Downloads PDFs for highlighted rows in Excel via an 8-layer pipeline:
   6. Europe PMC
   7. Sci-Hub       (improved URL parsing + title fallback)
   8. VPN/HTML      (doi.org with session + cookies)
+  9. Playwright    (real headless browser — handles JS, 403, anti-bot)
 
 Retry mode: if failed_downloads.csv exists, processes only those DOIs.
 Outputs: failed_downloads.csv, download_log.csv
+
+Requirements:
+  pip install requests openpyxl playwright
+  playwright install chromium
 """
 
 import os
@@ -500,6 +505,124 @@ def layer_vpn_html(doi: str, **_) -> tuple[bytes | None, str]:
     return (pdf, "") if pdf else (None, f"PDF URL {pdf_url}: {reason}")
 
 
+def layer_playwright(doi: str, **_) -> tuple[bytes | None, str]:
+    """
+    Launch a real headless Chromium browser via Playwright.
+    Executes JavaScript, handles anti-bot checks, and intercepts the PDF
+    either as a navigation response or by clicking the download button.
+    Requires: pip install playwright && playwright install chromium
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return None, "Playwright not installed (run: pip install playwright && playwright install chromium)"
+
+    doi_url = f"https://doi.org/{doi}"
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=BASE_HEADERS["User-Agent"],
+                accept_downloads=True,
+                viewport={"width": 1280, "height": 800},
+            )
+            page = context.new_page()
+
+            pdf_bytes = None
+            pdf_url_found = None
+
+            # Intercept responses to catch direct PDF streams
+            def on_response(response):
+                nonlocal pdf_bytes
+                ct = response.headers.get("content-type", "")
+                if "pdf" in ct.lower() and response.status == 200:
+                    try:
+                        pdf_bytes = response.body()
+                    except Exception:
+                        pass
+
+            page.on("response", on_response)
+
+            # Navigate to doi.org and wait for network to settle
+            try:
+                page.goto(doi_url, wait_until="networkidle", timeout=45_000)
+            except PWTimeout:
+                pass  # page may still be usable
+
+            if pdf_bytes and len(pdf_bytes) > 5_000:
+                browser.close()
+                return pdf_bytes, ""
+
+            final_url = page.url
+            html = page.content()
+
+            # Look for PDF link in fully-rendered HTML
+            pdf_url_found = find_pdf_url_in_html(html, final_url)
+
+            # OJS detection on rendered page
+            if not pdf_url_found:
+                ojs = ojs_pdf_url(final_url, html)
+                if ojs:
+                    pdf_url_found = ojs
+
+            # Try common "Download PDF" button selectors
+            if not pdf_url_found:
+                for selector in [
+                    "a[href*='.pdf']",
+                    "a[data-track-action='download pdf']",
+                    "a.pdf-download",
+                    "a#download-pdf",
+                    "a[title*='PDF' i]",
+                    "a[aria-label*='PDF' i]",
+                    "a:has-text('Download PDF')",
+                    "a:has-text('PDF')",
+                ]:
+                    try:
+                        el = page.locator(selector).first
+                        href = el.get_attribute("href", timeout=2_000)
+                        if href:
+                            pdf_url_found = make_absolute(href, final_url)
+                            break
+                    except Exception:
+                        continue
+
+            # If we found a URL, navigate to it (triggers response interception)
+            if pdf_url_found and not pdf_bytes:
+                try:
+                    with context.expect_page() as new_page_info:
+                        page.goto(pdf_url_found, wait_until="networkidle", timeout=30_000)
+                except Exception:
+                    pass
+                if not pdf_bytes:
+                    # Try direct download via requests using cookies from the browser session
+                    cookies = {c["name"]: c["value"] for c in context.cookies()}
+                    try:
+                        r = requests.get(
+                            pdf_url_found,
+                            headers={**PDF_HEADERS, "Referer": final_url},
+                            cookies=cookies,
+                            timeout=30,
+                            allow_redirects=True,
+                        )
+                        if r.status_code == 200 and "pdf" in r.headers.get("Content-Type", "").lower():
+                            if len(r.content) > 5_000:
+                                pdf_bytes = r.content
+                    except Exception:
+                        pass
+
+            browser.close()
+
+            if pdf_bytes and len(pdf_bytes) > 5_000:
+                return pdf_bytes, ""
+            if pdf_url_found:
+                return None, f"Playwright found URL {pdf_url_found} but could not download PDF"
+            return None, f"Playwright: no PDF found on {final_url}"
+
+    except Exception as e:
+        return None, f"Playwright exception: {e}"
+
+
 # ── Pipeline ───────────────────────────────────────────────────────────────────
 
 LAYERS = [
@@ -511,6 +634,7 @@ LAYERS = [
     ("Europe PMC",       layer_europe_pmc),
     ("Sci-Hub",          layer_scihub),
     ("VPN/HTML",         layer_vpn_html),
+    ("Playwright",       layer_playwright),
 ]
 
 
