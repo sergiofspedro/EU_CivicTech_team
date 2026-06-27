@@ -233,18 +233,6 @@ def build_excel(batches: list, lookup: dict, all_cols: list,
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    # ── Scopus batches 1–5 ───────────────────────────────────────────────────
-    print(f"\n{'='*60}")
-    print(f"SCOPUS BATCHES (1–5) → {OUTPUT_SCOPUS}")
-    print(f"{'='*60}")
-
-    if not os.path.exists(SCOPUS_EXCEL):
-        print(f"[ERROR] {SCOPUS_EXCEL} not found.")
-    else:
-        scopus_lookup, scopus_cols = build_scopus_lookup(SCOPUS_EXCEL)
-        build_excel(SCOPUS_BATCHES, scopus_lookup, scopus_cols,
-                    OUTPUT_SCOPUS, "Source sheet")
-
     # ── Grey literature batches 6–7 ──────────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"GREY LITERATURE BATCHES (6–7) → {OUTPUT_GREY}")
