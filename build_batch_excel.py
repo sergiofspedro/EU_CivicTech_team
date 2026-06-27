@@ -24,11 +24,11 @@ OUTPUT_FILE = "batch_overview.xlsx"
 # List of (sheet_name_in_output, path_to_batch_folder)
 # Edit these to match your actual folder paths and desired sheet names
 BATCH_FOLDERS = [
-    ("Batch 1", r"C:\Users\Administrator\Downloads\Livro\Batch1"),
-    ("Batch 2", r"C:\Users\Administrator\Downloads\Livro\Batch2"),
-    ("Batch 3", r"C:\Users\Administrator\Downloads\Livro\Batch3"),
-    ("Batch 4", r"C:\Users\Administrator\Downloads\Livro\Batch4"),
-    ("Batch 5", r"C:\Users\Administrator\Downloads\Livro\Batch5"),
+    ("Batch 1", r"C:\Users\Administrator\Downloads\Livro\HIGH relevance\1"),
+    ("Batch 2", r"C:\Users\Administrator\Downloads\Livro\HIGH relevance\2"),
+    ("Batch 3", r"C:\Users\Administrator\Downloads\Livro\HIGH relevance\3"),
+    ("Batch 4", r"C:\Users\Administrator\Downloads\Livro\MEDIUM screening\4"),
+    ("Batch 5", r"C:\Users\Administrator\Downloads\Livro\MEDIUM screening\5"),
 ]
 # ───────────────────────────────────────────────────────────────────────────────
 
