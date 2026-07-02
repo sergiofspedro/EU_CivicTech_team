@@ -14,8 +14,6 @@ import openpyxl
 
 # ─── CONFIGURATION ─────────────────────────────────────────────────────────────
 REVIEWED_EXCEL   = "batch_overview.xlsx"   # the file you highlighted
-BATCH_SHEETS     = ["Batch 1", "Batch 2", "Batch 3", "Batch 4", "Batch 5"]
-YELLOW_COLOR     = "FFFFFF00"
 
 # Source folders for each batch (must match where the PDFs actually live)
 BATCH_FOLDERS = {
@@ -25,18 +23,31 @@ BATCH_FOLDERS = {
     "Batch 4": r"C:\Users\Administrator\Downloads\Livro\MEDIUM screening\4",
     "Batch 5": r"C:\Users\Administrator\Downloads\Livro\MEDIUM screening\5",
 }
+BATCH_SHEETS = list(BATCH_FOLDERS.keys())
 
-DEST_FOLDER = r"C:\Users\Administrator\Downloads\Livro\Selected"
+DEST_FOLDER = r"C:\Users\Administrator\Downloads\Livro\New batch"
 # ───────────────────────────────────────────────────────────────────────────────
 
 
-def row_color(ws_row) -> str | None:
+def row_is_highlighted(ws_row) -> str | None:
+    """
+    Returns a description of the fill found on this row, or None if no
+    cell has a non-default background fill. Handles rgb, indexed, and
+    theme-based fill colors (Excel's "highlight" button can use any of these).
+    """
     for cell in ws_row:
         fill = cell.fill
-        if fill and fill.fgColor and fill.fgColor.type == "rgb":
-            rgb = fill.fgColor.rgb
-            if rgb and rgb not in ("00000000", "FF000000"):
-                return rgb
+        if not fill or fill.patternType is None:
+            continue
+        fg = fill.fgColor
+        if fg is None:
+            continue
+        if fg.type == "rgb" and fg.rgb and fg.rgb not in ("00000000", "FF000000", None):
+            return f"rgb:{fg.rgb}"
+        if fg.type == "indexed" and fg.indexed not in (64, 65):  # 64/65 = default/none
+            return f"indexed:{fg.indexed}"
+        if fg.type == "theme" and fg.theme is not None:
+            return f"theme:{fg.theme}/tint:{fg.tint}"
     return None
 
 
@@ -49,8 +60,9 @@ def main():
 
     wb = openpyxl.load_workbook(REVIEWED_EXCEL, data_only=True)
 
-    copied = missing = skipped_not_yellow = 0
+    copied = missing = 0
     missing_list = []
+    colors_seen = {}
 
     for sheet_name in BATCH_SHEETS:
         if sheet_name not in wb.sheetnames:
@@ -68,9 +80,10 @@ def main():
         sheet_count = 0
 
         for row in ws.iter_rows(min_row=2):
-            color = row_color(row)
-            if color != YELLOW_COLOR:
+            color = row_is_highlighted(row)
+            if color is None:
                 continue
+            colors_seen[color] = colors_seen.get(color, 0) + 1
 
             pdf_name = row[pdf_idx].value
             if not pdf_name:
@@ -103,6 +116,12 @@ def main():
     print(f"Total copied/found: {copied}")
     print(f"Missing source files: {missing}")
     print(f"Destination folder: {os.path.abspath(DEST_FOLDER)}")
+    print(f"\nFill colors detected on highlighted rows: {colors_seen if colors_seen else '(none found)'}")
+    if not colors_seen:
+        print("  No highlighted cells were detected at all. Possible causes:")
+        print("  - The highlights are in a different file than 'batch_overview.xlsx'")
+        print("  - The file was re-saved by a tool that stripped formatting")
+        print("  - You highlighted a column beyond what openpyxl scans (unlikely)")
 
     if missing_list:
         print(f"\nMissing files (source PDF not found in batch folder):")
